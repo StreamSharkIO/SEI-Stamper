@@ -44,6 +44,12 @@ typedef struct nvenc_encoder {
   uint8_t *inline_params;
   size_t inline_params_size;
 
+  /* H.264 SPS-derived info needed to build spec-valid pic_timing SEI payloads
+   * (the CPB/DPB delay fields are required when SPS has HRD parameters). */
+  bool h264_cpb_dpb_delays_present;
+  uint8_t h264_cpb_removal_delay_length;
+  uint8_t h264_dpb_output_delay_length;
+
   /* NTP 同步 */
   struct ntp_client ntp_client;
   uint64_t last_ntp_sync_time;

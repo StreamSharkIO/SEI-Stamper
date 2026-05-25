@@ -1,4 +1,5 @@
 #include "nvenc-encoder.h"
+#include "h264-sps.h"
 #include <util/dstr.h>
 #include <util/platform.h>
 
@@ -203,6 +204,59 @@ static uint8_t *nvenc_extradata_to_annexb(const uint8_t *extradata,
  * Already-valid P1-P7 strings pass through unchanged.
  */
 /*
+ * Patch H.264 extradata to set pic_struct_present_flag=1 in the SPS VUI.
+ * Without that flag, decoders skip pic_timing SEI messages and never surface
+ * AV_FRAME_DATA_S12M_TIMECODE — so VOD post-processing tooling that relies
+ * on stock "ffprobe -show_frames" gets no timecode side data.
+ *
+ * FFmpeg's h264_metadata BSF does NOT expose this flag as an option (verified
+ * against FFmpeg trunk), so we ship our own minimal SPS parser/patcher in
+ * h264-sps.c. On success replaces *extradata with a patched buffer; on
+ * failure (no SPS found, SPS uses scaling matrix or HRD params, flag was
+ * already set, etc.) leaves the input untouched and logs.
+ */
+static void nvenc_patch_h264_sps_vui(nvenc_encoder_t *enc,
+                                     uint8_t **extradata,
+                                     size_t *extradata_size) {
+  uint8_t *patched = NULL;
+  size_t patched_size = 0;
+  h264_sps_info_t info = {0};
+  bool applied = h264_sps_patch_pic_struct_present(
+      *extradata, *extradata_size, &patched, &patched_size, &info);
+  if (applied) {
+    bfree(*extradata);
+    *extradata = patched;
+    *extradata_size = patched_size;
+    encoder_log(LOG_INFO, enc,
+                "Patched H.264 SPS VUI (pic_struct_present_flag=1)");
+  } else if (info.parsed_ok) {
+    encoder_log(LOG_INFO, enc,
+                "H.264 SPS VUI patch not needed (pic_struct_present_flag "
+                "already set)");
+  } else {
+    encoder_log(LOG_WARNING, enc,
+                "H.264 SPS parse failed; pic_timing SEI may not surface as "
+                "S12M_TIMECODE downstream");
+  }
+
+  /* Record HRD-derived info regardless of patch outcome — needed by the
+   * pic_timing SEI builder to emit spec-valid payloads. */
+  if (info.parsed_ok) {
+    enc->h264_cpb_dpb_delays_present = info.cpb_dpb_delays_present;
+    enc->h264_cpb_removal_delay_length = info.cpb_removal_delay_length;
+    enc->h264_dpb_output_delay_length = info.dpb_output_delay_length;
+    if (info.cpb_dpb_delays_present) {
+      encoder_log(LOG_INFO, enc,
+                  "SPS HRD present: cpb_removal_delay_length=%u, "
+                  "dpb_output_delay_length=%u (pic_timing SEI will prepend "
+                  "zero-valued delays)",
+                  info.cpb_removal_delay_length,
+                  info.dpb_output_delay_length);
+    }
+  }
+}
+
+/*
  * Resolve the codec-appropriate profile string for FFmpeg's *_nvenc encoders.
  * The unified-encoder UI exposes H.264 profile names (baseline/main/high) for
  * all codecs, but hevc_nvenc accepts only main/main10/rext and av1_nvenc only
@@ -274,6 +328,115 @@ static const uint8_t *find_nal_start_code_nvenc(const uint8_t *data,
     }
   }
   return NULL;
+}
+
+/* Strip H.264 pic_timing SEI NAL units (payload type 1) from a packet,
+ * producing a new bmalloc'd buffer. NVENC emits its own pic_timing SEI per
+ * frame with clock_timestamp_flag=0 (no timecode), and the MPEG-TS muxer
+ * reorders SEIs into a canonical position before the slice — which puts
+ * NVENC's pic_timing after ours and overwrites the decoder's timecode
+ * state. Removing NVENC's leaves only our pic_timing in the access unit.
+ *
+ * Only touches single-message SEI NALs whose entire payload is pic_timing.
+ * If the SEI NAL contains multiple messages (uncommon for NVENC), it is
+ * kept intact to avoid splitting / re-encoding. */
+static uint8_t *strip_h264_pic_timing(const uint8_t *in, size_t in_size,
+                                      size_t *out_size) {
+  uint8_t *out = (uint8_t *)bmalloc(in_size);
+  if (!out) {
+    *out_size = 0;
+    return NULL;
+  }
+  size_t op = 0;
+  size_t scan = 0;
+  while (scan < in_size) {
+    /* Find next start code. */
+    size_t sc_size = 0;
+    const uint8_t *sc = find_nal_start_code_nvenc(in + scan, in_size - scan,
+                                                  &sc_size);
+    if (!sc) {
+      /* No more NALs; copy remainder verbatim. */
+      memcpy(out + op, in + scan, in_size - scan);
+      op += in_size - scan;
+      break;
+    }
+    size_t sc_off = (size_t)(sc - in);
+    /* Copy any pre-start-code bytes (typically zero-length except at start). */
+    if (sc_off > scan) {
+      memcpy(out + op, in + scan, sc_off - scan);
+      op += sc_off - scan;
+    }
+    size_t header_off = sc_off + sc_size;
+    if (header_off >= in_size) {
+      memcpy(out + op, in + sc_off, in_size - sc_off);
+      op += in_size - sc_off;
+      break;
+    }
+    /* Find next start code to determine current NAL's size. */
+    size_t next_sc_size = 0;
+    const uint8_t *next_sc =
+        find_nal_start_code_nvenc(in + header_off, in_size - header_off,
+                                  &next_sc_size);
+    size_t nal_end = next_sc ? (size_t)(next_sc - in) : in_size;
+    size_t nal_total = nal_end - sc_off;
+
+    uint8_t nal_header = in[header_off];
+    bool is_sei = ((nal_header & 0x1F) == 6);
+    bool drop = false;
+    /* Single-message SEI: first byte after NAL header is the payload type.
+     * If that byte equals 1, the whole NAL is pic_timing. (Multi-message
+     * SEIs are rare from NVENC and would have an extra type byte > 1 after
+     * pic_timing's payload — skip the drop in that case to stay safe.) */
+    if (is_sei && header_off + 1 < in_size && in[header_off + 1] == 1) {
+      drop = true;
+    }
+    if (!drop) {
+      memcpy(out + op, in + sc_off, nal_total);
+      op += nal_total;
+    }
+    scan = nal_end;
+  }
+  *out_size = op;
+  return out;
+}
+
+/* Find the offset (within `data`) of the start code that precedes the first
+ * VCL NAL unit (slice). Used to insert our SEI bundle *after* any encoder-
+ * emitted SEIs (e.g. NVENC's own pic_timing) but *before* the slice — so
+ * our pic_timing SEI is the last one parsed in the access unit and wins for
+ * decoder S12M_TIMECODE state.
+ *
+ * H.264 VCL types: 1 (non-IDR slice), 5 (IDR slice), 19/20/21 (SVC/MVC).
+ * HEVC VCL types: 0..31 (all slice variants).
+ * Returns `size` if no VCL NAL is found (caller treats as "append at end"). */
+static size_t find_first_vcl_offset(const uint8_t *data, size_t size,
+                                    int codec_type) {
+  if (size < 4)
+    return size;
+  size_t scan = 0;
+  while (scan < size) {
+    size_t sc_size = 0;
+    const uint8_t *sc = find_nal_start_code_nvenc(data + scan, size - scan,
+                                                  &sc_size);
+    if (!sc)
+      return size;
+    size_t sc_off = (size_t)(sc - data);
+    size_t header_off = sc_off + sc_size;
+    if (header_off >= size)
+      return size;
+    bool is_vcl = false;
+    if (codec_type == 0) { /* H.264 */
+      uint8_t t = data[header_off] & 0x1F;
+      is_vcl = (t == 1 || t == 5 || t == 19 || t == 20 || t == 21);
+    } else if (codec_type == 1) { /* HEVC */
+      uint8_t t = (data[header_off] >> 1) & 0x3F;
+      is_vcl = (t <= 31);
+    }
+    if (is_vcl)
+      return sc_off;
+    scan = header_off;
+  }
+  return size;
 }
 
 /* 查找参数集结束位置(SPS/PPS/VPS之后) */
@@ -518,6 +681,15 @@ void *nvenc_encoder_create_internal(obs_data_t *settings,
     encoder_log(LOG_INFO, enc, "Extra data size: %zu bytes",
                 enc->extra_data_size);
 
+    /* For H.264, patch the SPS VUI to enable pic_struct_present_flag so the
+     * pic_timing SEI we'll emit per-frame is actually parsed by decoders.
+     * Modifies enc->extra_data in place (replacing it with a patched copy
+     * if the BSF succeeds). The patched SPS then also flows into
+     * inline_params below. */
+    if (enc->codec_type == 0) {
+      nvenc_patch_h264_sps_vui(enc, &enc->extra_data, &enc->extra_data_size);
+    }
+
     /* For H.264 / H.265 with GLOBAL_HEADER on, build a reusable Annex-B
      * parameter-set payload (SPS/PPS, plus VPS for HEVC) so we can keep
      * parameter sets inline at every keyframe — required by MPEG-TS / SRT
@@ -620,9 +792,15 @@ bool nvenc_encoder_encode_internal(void *data, struct encoder_frame *frame,
   bool keyframe = (enc->packet->flags & AV_PKT_FLAG_KEY) != 0;
   uint8_t *sei_bundle = NULL;
   size_t sei_bundle_size = 0;
+  sei_bundle_codec_info_t codec_info = {
+      .h264_cpb_dpb_delays_present = enc->h264_cpb_dpb_delays_present,
+      .h264_cpb_removal_delay_length = enc->h264_cpb_removal_delay_length,
+      .h264_dpb_output_delay_length = enc->h264_dpb_output_delay_length,
+  };
   build_sei_bundle(enc->codec_type, keyframe, frame->pts,
                    &enc->current_ntp_time, (uint32_t)enc->fps_num,
-                   (uint32_t)enc->fps_den, &sei_bundle, &sei_bundle_size);
+                   (uint32_t)enc->fps_den, &codec_info, &sei_bundle,
+                   &sei_bundle_size);
 
   if (sei_bundle_size > 0) {
     encoder_log(LOG_DEBUG, enc,
@@ -658,21 +836,43 @@ bool nvenc_encoder_encode_internal(void *data, struct encoder_frame *frame,
       memcpy(enc->packet_buffer + offset, enc->packet->data + param_sets_end,
              remaining);
     } else if (enc->inline_params && enc->inline_params_size > 0) {
-      /* GLOBAL_HEADER path (H.264): re-inject our stashed SPS/PPS so
-       * MPEG-TS/SRT receivers can still decode. Order: stashed SPS/PPS →
-       * SEI bundle → slice. */
-      total_size =
-          enc->inline_params_size + sei_bundle_size + enc->packet->size;
+      /* GLOBAL_HEADER path: re-inject our stashed SPS/PPS (plus VPS for HEVC).
+       * For H.264, also strip NVENC's pic_timing SEI to avoid muxer
+       * reordering that puts NVENC's (clock_timestamp_flag=0) version after
+       * ours and overwrites the decoder's S12M_TIMECODE state. */
+      const uint8_t *src_data = enc->packet->data;
+      size_t src_size = (size_t)enc->packet->size;
+      uint8_t *cleaned = NULL;
+      if (enc->codec_type == 0) {
+        cleaned = strip_h264_pic_timing(enc->packet->data,
+                                        (size_t)enc->packet->size, &src_size);
+        if (cleaned) {
+          src_data = cleaned;
+        } else {
+          src_size = (size_t)enc->packet->size; /* fallback on alloc failure */
+        }
+      }
+      size_t vcl_off =
+          find_first_vcl_offset(src_data, src_size, enc->codec_type);
+      total_size = enc->inline_params_size + src_size + sei_bundle_size;
       if (enc->packet_buffer_size < total_size) {
         bfree(enc->packet_buffer);
         enc->packet_buffer = bmalloc(total_size);
         enc->packet_buffer_size = total_size;
       }
-      memcpy(enc->packet_buffer, enc->inline_params, enc->inline_params_size);
-      size_t offset = enc->inline_params_size;
+      size_t offset = 0;
+      memcpy(enc->packet_buffer + offset, enc->inline_params,
+             enc->inline_params_size);
+      offset += enc->inline_params_size;
+      memcpy(enc->packet_buffer + offset, src_data, vcl_off);
+      offset += vcl_off;
       memcpy(enc->packet_buffer + offset, sei_bundle, sei_bundle_size);
       offset += sei_bundle_size;
-      memcpy(enc->packet_buffer + offset, enc->packet->data, enc->packet->size);
+      memcpy(enc->packet_buffer + offset, src_data + vcl_off,
+             src_size - vcl_off);
+      if (cleaned) {
+        bfree(cleaned);
+      }
     } else {
       /* Last-resort fallback. */
       encoder_log(LOG_WARNING, enc,
@@ -683,10 +883,37 @@ bool nvenc_encoder_encode_internal(void *data, struct encoder_frame *frame,
              enc->packet->size);
     }
   } else {
-    /* Non-keyframe with bundle (HEVC time_code per-frame): SEI bundle → slice. */
-    memcpy(enc->packet_buffer, sei_bundle, sei_bundle_size);
-    memcpy(enc->packet_buffer + sei_bundle_size, enc->packet->data,
-           enc->packet->size);
+    /* Non-keyframe with bundle: strip NVENC's pic_timing (H.264 only) so the
+     * muxer can't reorder it to overwrite our decoder S12M_TIMECODE state,
+     * then insert our bundle before the slice. */
+    const uint8_t *src_data = enc->packet->data;
+    size_t src_size = (size_t)enc->packet->size;
+    uint8_t *cleaned = NULL;
+    if (enc->codec_type == 0) {
+      cleaned = strip_h264_pic_timing(enc->packet->data,
+                                      (size_t)enc->packet->size, &src_size);
+      if (cleaned) {
+        src_data = cleaned;
+      } else {
+        src_size = (size_t)enc->packet->size;
+      }
+    }
+    size_t vcl_off =
+        find_first_vcl_offset(src_data, src_size, enc->codec_type);
+    /* Resize buffer in case stripping changed sizes. */
+    total_size = src_size + sei_bundle_size;
+    if (enc->packet_buffer_size < total_size) {
+      bfree(enc->packet_buffer);
+      enc->packet_buffer = bmalloc(total_size);
+      enc->packet_buffer_size = total_size;
+    }
+    memcpy(enc->packet_buffer, src_data, vcl_off);
+    memcpy(enc->packet_buffer + vcl_off, sei_bundle, sei_bundle_size);
+    memcpy(enc->packet_buffer + vcl_off + sei_bundle_size,
+           src_data + vcl_off, src_size - vcl_off);
+    if (cleaned) {
+      bfree(cleaned);
+    }
   }
 
   if (sei_bundle) {
