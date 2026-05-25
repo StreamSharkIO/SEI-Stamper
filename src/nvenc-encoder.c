@@ -92,14 +92,20 @@ static bool nvenc_build_sei_nal_unit(uint8_t *payload, size_t payload_size,
 #endif
 
 /*
- * Convert FFmpeg's H.264 extradata to a raw Annex-B byte stream so it can be
- * prepended inline at each keyframe. FFmpeg's h264_nvenc emits extradata in
- * Annex-B form (with start codes) when AV_CODEC_FLAG_GLOBAL_HEADER is set, but
- * for safety we also handle the AVCDecoderConfigurationRecord (AVCC) form.
+ * Convert FFmpeg's encoder extradata to a raw Annex-B byte stream so it can
+ * be prepended inline at each keyframe. FFmpeg's h264_nvenc / hevc_nvenc
+ * both emit extradata in Annex-B form (with start codes) when
+ * AV_CODEC_FLAG_GLOBAL_HEADER is set — which is the path we take in this
+ * plugin. As a defensive fallback, the H.264 AVCDecoderConfigurationRecord
+ * (AVCC) layout is also parsed; HEVC's HEVCDecoderConfigurationRecord
+ * (HVCC) is not parsed and will result in a NULL return + caller warning
+ * (which is fine for recording-only use cases — only mid-stream SRT joiners
+ * would feel it).
+ *
  * Returns a bmalloc'd buffer, or NULL on failure. *out_size is set to 0 on
  * failure or when the input format is unrecognised.
  */
-static uint8_t *nvenc_h264_extradata_to_annexb(const uint8_t *extradata,
+static uint8_t *nvenc_extradata_to_annexb(const uint8_t *extradata,
                                                size_t extradata_size,
                                                size_t *out_size) {
   *out_size = 0;
@@ -196,6 +202,38 @@ static uint8_t *nvenc_h264_extradata_to_annexb(const uint8_t *extradata,
  * so passing them through to FFmpeg fails with EINVAL on modern systems.
  * Already-valid P1-P7 strings pass through unchanged.
  */
+/*
+ * Resolve the codec-appropriate profile string for FFmpeg's *_nvenc encoders.
+ * The unified-encoder UI exposes H.264 profile names (baseline/main/high) for
+ * all codecs, but hevc_nvenc accepts only main/main10/rext and av1_nvenc only
+ * main. Passing "high" to hevc_nvenc returns EINVAL from avcodec_open2 — so
+ * we coerce unrecognised values to a sensible default per codec.
+ *
+ * codec_type: 0 = H.264, 1 = H.265, 2 = AV1.
+ * Returns a string suitable for av_dict_set("profile", ...). NULL means "do
+ * not set the profile option" (let FFmpeg pick the default).
+ */
+static const char *nvenc_resolve_profile(int codec_type, const char *in) {
+  if (codec_type == 0) {
+    /* h264_nvenc: baseline / main / high / high444p — pass through. */
+    if (!in || !*in) return "high";
+    return in;
+  }
+  if (codec_type == 1) {
+    /* hevc_nvenc: main / main10 / rext. */
+    if (in && (!strcmp(in, "main") || !strcmp(in, "main10") ||
+               !strcmp(in, "rext"))) {
+      return in;
+    }
+    return "main";
+  }
+  if (codec_type == 2) {
+    /* av1_nvenc: main only. */
+    return "main";
+  }
+  return NULL;
+}
+
 static const char *nvenc_translate_preset(const char *in) {
   if (!in || !*in)
     return "p4";
@@ -417,14 +455,15 @@ void *nvenc_encoder_create_internal(obs_data_t *settings,
   enc->codec_context->gop_size = enc->keyint;
   enc->codec_context->max_b_frames = enc->bframes;
 
-  /* For H.264 only: enable GLOBAL_HEADER so FFmpeg populates extradata at
-   * avcodec_open2() with an SPS/PPS sequence header. Without this, NVENC's
-   * extradata stays empty and OBS's RTMP/FLV muxer has no AVCDecoder-
-   * ConfigurationRecord to send, which causes ingest servers (e.g. Streamshark)
-   * to drop the stream within ~100ms with zero frames sent. We restore the
-   * inline SPS/PPS at each keyframe ourselves below, preserving MPEG-TS/SRT
-   * behaviour. H.265 keeps its v1.2.2 SLS-compat behaviour (no GLOBAL_HEADER). */
-  if (enc->codec_type == 0) {
+  /* Enable GLOBAL_HEADER for H.264 and H.265 so FFmpeg populates extradata
+   * at avcodec_open2() with a codec sequence header. Without it:
+   *   - H.264: OBS's RTMP/FLV muxer has no AVCDecoderConfigurationRecord
+   *     → ingest servers drop the stream within ~100ms.
+   *   - H.265: OBS's file muxer has no HEVCDecoderConfigurationRecord
+   *     → recording hangs at stop / never finalises the file.
+   * We restore inline SPS/PPS at each keyframe ourselves (see encode loop)
+   * to keep MPEG-TS/SRT receivers happy. AV1 untouched. */
+  if (enc->codec_type == 0 || enc->codec_type == 1) {
     enc->codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   }
 
@@ -438,9 +477,14 @@ void *nvenc_encoder_create_internal(obs_data_t *settings,
   encoder_log(LOG_INFO, enc, "Using NVENC preset: %s (requested: %s)",
               nvenc_preset, (enc->preset && *enc->preset) ? enc->preset : "(default)");
 
-  /* Profile */
-  if (enc->profile && strlen(enc->profile) > 0) {
-    av_dict_set(&opts, "profile", enc->profile, 0);
+  /* Profile (coerce to codec-valid value — UI exposes H.264 names for all
+   * codecs, but hevc_nvenc/av1_nvenc reject "high" with EINVAL). */
+  const char *nvenc_profile = nvenc_resolve_profile(enc->codec_type, enc->profile);
+  if (nvenc_profile) {
+    av_dict_set(&opts, "profile", nvenc_profile, 0);
+    encoder_log(LOG_INFO, enc, "Using NVENC profile: %s (requested: %s)",
+                nvenc_profile,
+                (enc->profile && *enc->profile) ? enc->profile : "(default)");
   }
 
   /* Rate control - CBR */
@@ -474,26 +518,28 @@ void *nvenc_encoder_create_internal(obs_data_t *settings,
     encoder_log(LOG_INFO, enc, "Extra data size: %zu bytes",
                 enc->extra_data_size);
 
-    /* For H.264 with GLOBAL_HEADER on, build a reusable Annex-B SPS/PPS
-     * payload so we can keep parameter sets inline at every keyframe (needed
-     * for SRT/MPEG-TS receivers that join mid-stream). */
-    if (enc->codec_type == 0) {
-      enc->inline_params = nvenc_h264_extradata_to_annexb(
+    /* For H.264 / H.265 with GLOBAL_HEADER on, build a reusable Annex-B
+     * parameter-set payload (SPS/PPS, plus VPS for HEVC) so we can keep
+     * parameter sets inline at every keyframe — required by MPEG-TS / SRT
+     * receivers that join mid-stream. */
+    if (enc->codec_type == 0 || enc->codec_type == 1) {
+      enc->inline_params = nvenc_extradata_to_annexb(
           enc->extra_data, enc->extra_data_size, &enc->inline_params_size);
       if (enc->inline_params && enc->inline_params_size > 0) {
         encoder_log(LOG_INFO, enc,
-                    "Inline SPS/PPS payload built: %zu bytes (Annex-B)",
+                    "Inline parameter set payload built: %zu bytes (Annex-B)",
                     enc->inline_params_size);
       } else {
         encoder_log(LOG_WARNING, enc,
-                    "Could not build inline SPS/PPS from extradata; SRT "
-                    "consumers may need to wait for next out-of-band header");
+                    "Could not build inline parameter sets from extradata; "
+                    "mid-stream SRT/MPEG-TS joiners may need to wait for the "
+                    "next out-of-band header");
       }
     }
-  } else if (enc->codec_type == 0) {
+  } else if (enc->codec_type == 0 || enc->codec_type == 1) {
     encoder_log(LOG_WARNING, enc,
-                "H.264 extradata is empty after open — RTMP/FLV will likely "
-                "fail (no AVC sequence header)");
+                "Extradata is empty after open — file recording / RTMP will "
+                "likely fail (no codec sequence header in container)");
   }
 
   encoder_log(LOG_INFO, enc,
@@ -568,60 +614,55 @@ bool nvenc_encoder_encode_internal(void *data, struct encoder_frame *frame,
   }
   ntp_client_get_time(&enc->ntp_client, &enc->current_ntp_time);
 
-  /* SEI 插入 (关键帧) */
+  /* Build per-frame SEI bundle: HEVC time_code SEI on every frame plus the
+   * UUID NTP SEI at keyframes. For H.264 / AV1 non-keyframes, the bundle is
+   * empty and we copy the packet through unchanged. */
   bool keyframe = (enc->packet->flags & AV_PKT_FLAG_KEY) != 0;
-  uint8_t *sei_nal = NULL;
-  size_t sei_nal_size = 0;
+  uint8_t *sei_bundle = NULL;
+  size_t sei_bundle_size = 0;
+  build_sei_bundle(enc->codec_type, keyframe, frame->pts,
+                   &enc->current_ntp_time, (uint32_t)enc->fps_num,
+                   (uint32_t)enc->fps_den, &sei_bundle, &sei_bundle_size);
 
-  if (keyframe) {
-    uint8_t *payload = NULL;
-    size_t payload_size = 0;
-    if (build_ntp_sei_payload(frame->pts, &enc->current_ntp_time,
-                                    &payload, &payload_size)) {
-      sei_nal_type_t nal_type = (enc->codec_type == 1) ? SEI_NAL_H265_PREFIX : SEI_NAL_H264;
-      build_sei_nal_unit(payload, payload_size, nal_type, &sei_nal,
-                               &sei_nal_size);
-      bfree(payload);
-
-      encoder_log(LOG_DEBUG, enc,
-                  "[NVENC] Inserted SEI: PTS=%lld NTP=%u.%u Size=%zu",
-                  frame->pts, enc->current_ntp_time.seconds,
-                  enc->current_ntp_time.fraction, sei_nal_size);
-    }
+  if (sei_bundle_size > 0) {
+    encoder_log(LOG_DEBUG, enc,
+                "[NVENC] SEI bundle: %zu bytes (keyframe=%d codec=%d)",
+                sei_bundle_size, keyframe, enc->codec_type);
   }
 
-  /* 组装Packet with correct SEI insertion position */
-  size_t total_size = enc->packet->size + sei_nal_size;
+  /* Assemble final packet: maybe-prepend parameter sets, then SEI bundle,
+   * then the encoded slice data. */
+  size_t total_size = enc->packet->size + sei_bundle_size;
   if (enc->packet_buffer_size < total_size) {
     bfree(enc->packet_buffer);
     enc->packet_buffer = bmalloc(total_size);
     enc->packet_buffer_size = total_size;
   }
 
-  if (sei_nal && keyframe) {
-    /* 查找参数集结束位置 */
+  if (sei_bundle_size == 0) {
+    /* Nothing to splice in. */
+    memcpy(enc->packet_buffer, enc->packet->data, enc->packet->size);
+  } else if (keyframe) {
+    /* Keyframe: insert bundle after parameter sets. */
     size_t param_sets_end = find_parameter_sets_end_nvenc(
         enc->packet->data, enc->packet->size, enc->codec_type);
 
     if (param_sets_end > 0 && param_sets_end < enc->packet->size) {
-      /* FFmpeg emitted SPS/PPS inline (e.g. H.265 path, or H.264 without
-       * GLOBAL_HEADER). Order: existing parameter sets → SEI → IDR slice. */
+      /* FFmpeg emitted SPS/PPS inline (H.265 path, or H.264 without
+       * GLOBAL_HEADER). Order: existing parameter sets → SEI bundle → IDR. */
       memcpy(enc->packet_buffer, enc->packet->data, param_sets_end);
       size_t offset = param_sets_end;
-      memcpy(enc->packet_buffer + offset, sei_nal, sei_nal_size);
-      offset += sei_nal_size;
+      memcpy(enc->packet_buffer + offset, sei_bundle, sei_bundle_size);
+      offset += sei_bundle_size;
       size_t remaining = enc->packet->size - param_sets_end;
       memcpy(enc->packet_buffer + offset, enc->packet->data + param_sets_end,
              remaining);
-      encoder_log(LOG_DEBUG, enc,
-                  "SEI inserted after parameter sets (offset: %zu)",
-                  param_sets_end);
     } else if (enc->inline_params && enc->inline_params_size > 0) {
-      /* GLOBAL_HEADER path (H.264): FFmpeg dropped SPS/PPS from the packet;
-       * re-inject them inline so MPEG-TS/SRT receivers can still decode.
-       * Order: SPS/PPS (Annex-B from extradata) → SEI → IDR slice. */
+      /* GLOBAL_HEADER path (H.264): re-inject our stashed SPS/PPS so
+       * MPEG-TS/SRT receivers can still decode. Order: stashed SPS/PPS →
+       * SEI bundle → slice. */
       total_size =
-          enc->inline_params_size + sei_nal_size + enc->packet->size;
+          enc->inline_params_size + sei_bundle_size + enc->packet->size;
       if (enc->packet_buffer_size < total_size) {
         bfree(enc->packet_buffer);
         enc->packet_buffer = bmalloc(total_size);
@@ -629,26 +670,27 @@ bool nvenc_encoder_encode_internal(void *data, struct encoder_frame *frame,
       }
       memcpy(enc->packet_buffer, enc->inline_params, enc->inline_params_size);
       size_t offset = enc->inline_params_size;
-      memcpy(enc->packet_buffer + offset, sei_nal, sei_nal_size);
-      offset += sei_nal_size;
+      memcpy(enc->packet_buffer + offset, sei_bundle, sei_bundle_size);
+      offset += sei_bundle_size;
       memcpy(enc->packet_buffer + offset, enc->packet->data, enc->packet->size);
-      encoder_log(LOG_DEBUG, enc,
-                  "Inline SPS/PPS+SEI prepended to keyframe (%zu + %zu bytes)",
-                  enc->inline_params_size, sei_nal_size);
     } else {
-      /* Last-resort fallback: just put SEI before the IDR slice. */
+      /* Last-resort fallback. */
       encoder_log(LOG_WARNING, enc,
                   "Could not find parameter sets end, inserting SEI at "
                   "beginning (may cause decoding issues)");
-      memcpy(enc->packet_buffer, sei_nal, sei_nal_size);
-      memcpy(enc->packet_buffer + sei_nal_size, enc->packet->data,
+      memcpy(enc->packet_buffer, sei_bundle, sei_bundle_size);
+      memcpy(enc->packet_buffer + sei_bundle_size, enc->packet->data,
              enc->packet->size);
     }
-
-    bfree(sei_nal);
   } else {
-    /* 非关键帧或无SEI */
-    memcpy(enc->packet_buffer, enc->packet->data, enc->packet->size);
+    /* Non-keyframe with bundle (HEVC time_code per-frame): SEI bundle → slice. */
+    memcpy(enc->packet_buffer, sei_bundle, sei_bundle_size);
+    memcpy(enc->packet_buffer + sei_bundle_size, enc->packet->data,
+           enc->packet->size);
+  }
+
+  if (sei_bundle) {
+    bfree(sei_bundle);
   }
 
   packet->data = enc->packet_buffer;
