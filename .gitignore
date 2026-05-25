@@ -99,6 +99,7 @@ h265wb.md
 # AI Assistant / Agent files
 .agent/
 .gemini/
+.claude/
 *.brain/
 
 # Keep important files
