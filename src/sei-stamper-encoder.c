@@ -373,7 +373,8 @@ static bool sei_stamper_encoder_encode(void *data, struct encoder_frame *frame,
       }
       /* AV1使用不同的SEI机制，暂时跳过 */
       if (enc->codec_type != SEI_STAMPER_CODEC_AV1) {
-        if (build_sei_nal_unit(payload, payload_size, nal_type, &sei_nal,
+        if (build_sei_nal_unit(payload, payload_size, nal_type,
+                               SEI_TYPE_USER_DATA_UNREGISTERED, &sei_nal,
                                &sei_nal_size)) {
           has_sei = true;
         }

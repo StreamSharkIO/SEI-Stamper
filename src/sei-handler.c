@@ -108,8 +108,8 @@ bool build_ntp_sei_payload(int64_t pts, const ntp_timestamp_t *ntp_time,
 
 /* 构建完整的SEI NAL单元 */
 bool build_sei_nal_unit(const uint8_t *payload, size_t payload_size,
-                        sei_nal_type_t nal_type, uint8_t **nal_unit_out,
-                        size_t *nal_unit_size) {
+                        sei_nal_type_t nal_type, unsigned payload_type,
+                        uint8_t **nal_unit_out, size_t *nal_unit_size) {
   if (!payload || !nal_unit_out || !nal_unit_size) {
     sei_log(LOG_ERROR, "Invalid parameters for build_sei_nal_unit");
     return false;
@@ -128,8 +128,7 @@ bool build_sei_nal_unit(const uint8_t *payload, size_t payload_size,
   uint8_t type_buf[10];
   uint8_t size_buf[10];
 
-  size_t type_len =
-      write_variable_length(type_buf, SEI_TYPE_USER_DATA_UNREGISTERED);
+  size_t type_len = write_variable_length(type_buf, payload_type);
   /* payloadSize 写入 RBSP 原始长度（EPB转义前），符合规范 */
   size_t size_len = write_variable_length(size_buf, payload_size);
 
@@ -201,6 +200,189 @@ bool build_sei_nal_unit(const uint8_t *payload, size_t payload_size,
   return true;
 }
 
+
+/* Convert NTP wall-clock to SMPTE 12M timecode for the time-of-day moment.
+ *
+ * NTP seconds field is seconds since 1900-01-01 UTC. SMPTE 12M only carries
+ * HH:MM:SS:FF, so we discard the day component via modulo 86400. The
+ * fractional second field is a fixed-point fraction (numerator over 2^32);
+ * multiplying by fps gives the sub-second frame number.
+ */
+void ntp_to_smpte_timecode(const ntp_timestamp_t *ntp,
+                           uint32_t fps_num, uint32_t fps_den,
+                           smpte_timecode_t *out) {
+  if (!ntp || !out || fps_num == 0 || fps_den == 0) {
+    if (out) {
+      memset(out, 0, sizeof(*out));
+    }
+    return;
+  }
+
+  /* Time-of-day in whole seconds (UTC). */
+  uint32_t seconds_in_day = ntp->seconds % 86400u;
+  out->hours = (uint8_t)(seconds_in_day / 3600u);
+  out->minutes = (uint8_t)((seconds_in_day % 3600u) / 60u);
+  out->seconds = (uint8_t)(seconds_in_day % 60u);
+
+  /* Frame number = floor(fraction * fps). NTP fraction is q32, so
+   * frame = (fraction * fps_num) / (fps_den * 2^32). The intermediate product
+   * fits comfortably in uint64_t for any realistic fps. */
+  uint64_t product = (uint64_t)ntp->fraction * (uint64_t)fps_num;
+  uint64_t denom = (uint64_t)fps_den * 4294967296ULL;
+  uint32_t frame = (uint32_t)(product / denom);
+
+  /* Clamp to ceil(fps_num/fps_den) - 1 just in case of edge rounding. */
+  uint32_t fps_ceil = (fps_num + fps_den - 1) / fps_den;
+  if (fps_ceil > 0 && frame >= fps_ceil) {
+    frame = fps_ceil - 1;
+  }
+  out->frames = (uint16_t)frame;
+
+  /* Drop-frame applies only to NTSC rates derived from 1001 denominator. */
+  out->drop_frame = (fps_den == 1001 &&
+                     (fps_num == 30000 || fps_num == 60000));
+}
+
+/* Build the 5-byte HEVC time_code SEI payload (one clock timestamp,
+ * full_timestamp_flag=1, no time_offset_value). Bit layout per
+ * ITU-T H.265 §D.2.27 — total 38 bits + 2 trailing bits = 5 bytes. */
+bool build_hevc_time_code_sei_payload(const smpte_timecode_t *tc,
+                                      uint8_t **payload_out,
+                                      size_t *payload_size) {
+  if (!tc || !payload_out || !payload_size) {
+    return false;
+  }
+
+  /* Fields, packed MSB-first into a 5-byte buffer:
+   *   num_clock_ts            u(2)   = 1
+   *   clock_timestamp_flag    u(1)   = 1
+   *   units_field_based_flag  u(1)   = 0
+   *   counting_type           u(5)   = 0
+   *   full_timestamp_flag     u(1)   = 1
+   *   discontinuity_flag      u(1)   = 0
+   *   cnt_dropped_flag        u(1)   = tc->drop_frame
+   *   n_frames                u(9)   = tc->frames
+   *   seconds_value           u(6)   = tc->seconds
+   *   minutes_value           u(6)   = tc->minutes
+   *   hours_value             u(5)   = tc->hours
+   * Then SEI payload byte-alignment: trailing '1' + zero-fill.
+   */
+
+  uint8_t *p = (uint8_t *)bmalloc(5);
+  if (!p) {
+    return false;
+  }
+  memset(p, 0, 5);
+
+  /* Pack bits via a running cursor. */
+  size_t bit_cursor = 0;
+  #define PUT_BITS(value, nbits)                                               \
+    do {                                                                       \
+      uint32_t _v = (uint32_t)(value);                                         \
+      for (int _i = (int)(nbits) - 1; _i >= 0; _i--) {                         \
+        uint8_t _b = (uint8_t)((_v >> _i) & 1u);                               \
+        p[bit_cursor >> 3] |= (uint8_t)(_b << (7 - (bit_cursor & 7)));         \
+        bit_cursor++;                                                          \
+      }                                                                        \
+    } while (0)
+
+  PUT_BITS(1, 2);                       /* num_clock_ts */
+  PUT_BITS(1, 1);                       /* clock_timestamp_flag */
+  PUT_BITS(0, 1);                       /* units_field_based_flag */
+  PUT_BITS(0, 5);                       /* counting_type */
+  PUT_BITS(1, 1);                       /* full_timestamp_flag */
+  PUT_BITS(0, 1);                       /* discontinuity_flag */
+  PUT_BITS(tc->drop_frame ? 1 : 0, 1);  /* cnt_dropped_flag */
+  PUT_BITS(tc->frames & 0x1FF, 9);      /* n_frames */
+  PUT_BITS(tc->seconds & 0x3F, 6);      /* seconds_value */
+  PUT_BITS(tc->minutes & 0x3F, 6);      /* minutes_value */
+  PUT_BITS(tc->hours & 0x1F, 5);        /* hours_value */
+  /* time_offset_length is 0 (no VUI override) → no time_offset_value. */
+
+  /* SEI payload byte-alignment: append '1' then zeros to next byte boundary. */
+  PUT_BITS(1, 1);
+  while ((bit_cursor & 7) != 0) {
+    PUT_BITS(0, 1);
+  }
+  #undef PUT_BITS
+
+  *payload_out = p;
+  *payload_size = bit_cursor >> 3;  /* always 5 */
+  return true;
+}
+
+/* Build the per-frame SEI bundle (timecode + optional UUID). */
+bool build_sei_bundle(int codec_type, bool is_keyframe,
+                      int64_t pts, const ntp_timestamp_t *ntp_time,
+                      uint32_t fps_num, uint32_t fps_den,
+                      uint8_t **bundle_out, size_t *bundle_size) {
+  if (!bundle_out || !bundle_size) {
+    return false;
+  }
+  *bundle_out = NULL;
+  *bundle_size = 0;
+
+  uint8_t *tc_nal = NULL;
+  size_t tc_nal_size = 0;
+  uint8_t *uuid_nal = NULL;
+  size_t uuid_nal_size = 0;
+
+  /* HEVC time_code SEI — every frame for stock-ffmpeg S12M_TIMECODE
+   * extraction. AV1 has its own metadata OBUs and is out of scope for
+   * Phase 1; H.264 needs SPS VUI plumbing and is also deferred. */
+  if (codec_type == 1 && ntp_time) {
+    smpte_timecode_t tc;
+    ntp_to_smpte_timecode(ntp_time, fps_num, fps_den, &tc);
+    uint8_t *tc_payload = NULL;
+    size_t tc_payload_size = 0;
+    if (build_hevc_time_code_sei_payload(&tc, &tc_payload, &tc_payload_size)) {
+      build_sei_nal_unit(tc_payload, tc_payload_size, SEI_NAL_H265_PREFIX,
+                         SEI_TYPE_TIME_CODE_HEVC, &tc_nal, &tc_nal_size);
+      bfree(tc_payload);
+    }
+  }
+
+  /* UUID SEI — only at keyframes (live-sync receiver only needs cadence,
+   * matches current v1.2.2 behaviour bit-for-bit). */
+  if (is_keyframe && ntp_time) {
+    uint8_t *uuid_payload = NULL;
+    size_t uuid_payload_size = 0;
+    if (build_ntp_sei_payload(pts, ntp_time, &uuid_payload, &uuid_payload_size)) {
+      sei_nal_type_t nal_type = (codec_type == 1) ? SEI_NAL_H265_PREFIX
+                                                  : SEI_NAL_H264;
+      build_sei_nal_unit(uuid_payload, uuid_payload_size, nal_type,
+                         SEI_TYPE_USER_DATA_UNREGISTERED,
+                         &uuid_nal, &uuid_nal_size);
+      bfree(uuid_payload);
+    }
+  }
+
+  size_t total = tc_nal_size + uuid_nal_size;
+  if (total == 0) {
+    return true;  /* No SEI for this frame — not an error. */
+  }
+
+  uint8_t *bundle = (uint8_t *)bmalloc(total);
+  if (!bundle) {
+    if (tc_nal) bfree(tc_nal);
+    if (uuid_nal) bfree(uuid_nal);
+    return false;
+  }
+  size_t off = 0;
+  if (tc_nal_size > 0) {
+    memcpy(bundle + off, tc_nal, tc_nal_size);
+    off += tc_nal_size;
+    bfree(tc_nal);
+  }
+  if (uuid_nal_size > 0) {
+    memcpy(bundle + off, uuid_nal, uuid_nal_size);
+    bfree(uuid_nal);
+  }
+
+  *bundle_out = bundle;
+  *bundle_size = total;
+  return true;
+}
 
 /* 合并SEI数据 */
 bool merge_sei_data(const uint8_t *original_sei, size_t original_size,

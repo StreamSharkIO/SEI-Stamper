@@ -419,7 +419,9 @@ bool amd_encoder_encode_internal(void *data, struct encoder_frame *frame,
     if (build_ntp_sei_payload(frame->pts, &enc->current_ntp_time, &payload,
                                   &payload_size)) {
       sei_nal_type_t nal_type = (enc->codec_type == 1) ? SEI_NAL_H265_PREFIX : SEI_NAL_H264;
-      build_sei_nal_unit(payload, payload_size, nal_type, &sei_nal, &sei_nal_size);
+      build_sei_nal_unit(payload, payload_size, nal_type,
+                         SEI_TYPE_USER_DATA_UNREGISTERED, &sei_nal,
+                         &sei_nal_size);
       bfree(payload);
 
       encoder_log(LOG_DEBUG, enc,
