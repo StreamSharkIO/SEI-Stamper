@@ -311,10 +311,95 @@ bool build_hevc_time_code_sei_payload(const smpte_timecode_t *tc,
   return true;
 }
 
+/* Build the H.264 pic_timing SEI payload. Bit layout per ITU-T H.264 §D.1.2.
+ *
+ * Total data bits = (cpb_len + dpb_len if delays present, else 0) + 41
+ *                   (the 41 fields after pic_struct presence is assumed).
+ * Then trailing '1' + zero fill to next byte boundary.
+ *
+ * For NVENC's default SPS, cpb/dpb lengths are typically 24+24 = 48, giving
+ * 89 data bits + 1 trailing + 6 zero pad = 96 bits = 12 bytes. With delays
+ * absent, the payload is 6 bytes (legacy size). */
+bool build_h264_pic_timing_sei_payload(const smpte_timecode_t *tc,
+                                       bool cpb_dpb_delays_present,
+                                       uint8_t cpb_removal_delay_length,
+                                       uint8_t dpb_output_delay_length,
+                                       uint8_t **payload_out,
+                                       size_t *payload_size) {
+  if (!tc || !payload_out || !payload_size) {
+    return false;
+  }
+  if (cpb_dpb_delays_present) {
+    /* Spec range 1..32 inclusive. */
+    if (cpb_removal_delay_length < 1 || cpb_removal_delay_length > 32 ||
+        dpb_output_delay_length < 1 || dpb_output_delay_length > 32) {
+      return false;
+    }
+  }
+
+  /* Compute total bits + allocate appropriately. */
+  size_t prefix_bits =
+      cpb_dpb_delays_present
+          ? ((size_t)cpb_removal_delay_length + (size_t)dpb_output_delay_length)
+          : 0;
+  size_t data_bits = prefix_bits + 41;          /* 41 = pic_struct + clock_ts */
+  size_t total_bits = data_bits + 1;            /* trailing '1' */
+  size_t buf_bytes = (total_bits + 7) / 8;      /* byte-align */
+
+  uint8_t *p = (uint8_t *)bmalloc(buf_bytes);
+  if (!p) {
+    return false;
+  }
+  memset(p, 0, buf_bytes);
+
+  size_t bit_cursor = 0;
+  #define PUT_BITS(value, nbits)                                               \
+    do {                                                                       \
+      uint32_t _v = (uint32_t)(value);                                         \
+      for (int _i = (int)(nbits) - 1; _i >= 0; _i--) {                         \
+        uint8_t _b = (uint8_t)((_v >> _i) & 1u);                               \
+        p[bit_cursor >> 3] |= (uint8_t)(_b << (7 - (bit_cursor & 7)));         \
+        bit_cursor++;                                                          \
+      }                                                                        \
+    } while (0)
+
+  /* CPB/DPB delays (zero-valued — we don't simulate the buffer model, but
+   * the decoder just reads them; ffmpeg's pic_timing parser then proceeds
+   * to the pic_struct fields which it cares about). */
+  if (cpb_dpb_delays_present) {
+    PUT_BITS(0, cpb_removal_delay_length);
+    PUT_BITS(0, dpb_output_delay_length);
+  }
+
+  PUT_BITS(0, 4);                       /* pic_struct = 0 (frame) */
+  PUT_BITS(1, 1);                       /* clock_timestamp_flag */
+  PUT_BITS(0, 2);                       /* ct_type */
+  PUT_BITS(0, 1);                       /* nuit_field_based_flag */
+  PUT_BITS(0, 5);                       /* counting_type */
+  PUT_BITS(1, 1);                       /* full_timestamp_flag */
+  PUT_BITS(0, 1);                       /* discontinuity_flag */
+  PUT_BITS(tc->drop_frame ? 1 : 0, 1);  /* cnt_dropped_flag */
+  PUT_BITS(tc->frames & 0xFF, 8);       /* n_frames (8 bits in H.264) */
+  PUT_BITS(tc->seconds & 0x3F, 6);
+  PUT_BITS(tc->minutes & 0x3F, 6);
+  PUT_BITS(tc->hours & 0x1F, 5);
+
+  PUT_BITS(1, 1);                       /* trailing '1' */
+  while ((bit_cursor & 7) != 0) {
+    PUT_BITS(0, 1);
+  }
+  #undef PUT_BITS
+
+  *payload_out = p;
+  *payload_size = bit_cursor >> 3;
+  return true;
+}
+
 /* Build the per-frame SEI bundle (timecode + optional UUID). */
 bool build_sei_bundle(int codec_type, bool is_keyframe,
                       int64_t pts, const ntp_timestamp_t *ntp_time,
                       uint32_t fps_num, uint32_t fps_den,
+                      const sei_bundle_codec_info_t *codec_info,
                       uint8_t **bundle_out, size_t *bundle_size) {
   if (!bundle_out || !bundle_size) {
     return false;
@@ -327,9 +412,16 @@ bool build_sei_bundle(int codec_type, bool is_keyframe,
   uint8_t *uuid_nal = NULL;
   size_t uuid_nal_size = 0;
 
-  /* HEVC time_code SEI — every frame for stock-ffmpeg S12M_TIMECODE
-   * extraction. AV1 has its own metadata OBUs and is out of scope for
-   * Phase 1; H.264 needs SPS VUI plumbing and is also deferred. */
+  /* Standards-compliant timecode SEI — emitted every frame so stock
+   * ffmpeg surfaces AV_FRAME_DATA_S12M_TIMECODE on every decoded frame —
+   * the data VOD post-processing pipelines read to derive HLS
+   * PROGRAM-DATE-TIME.
+   *   - HEVC:  time_code SEI (payload type 136, ITU-T H.265 §D.2.27).
+   *   - H.264: pic_timing SEI (payload type 1, ITU-T H.264 §D.1.2).
+   *            Requires pic_struct_present_flag=1 in the SPS VUI — set
+   *            via the h264_metadata BSF at encoder init (see
+   *            nvenc-encoder.c).
+   *   - AV1:   out of scope; metadata OBUs are a separate mechanism. */
   if (codec_type == 1 && ntp_time) {
     smpte_timecode_t tc;
     ntp_to_smpte_timecode(ntp_time, fps_num, fps_den, &tc);
@@ -339,6 +431,20 @@ bool build_sei_bundle(int codec_type, bool is_keyframe,
       build_sei_nal_unit(tc_payload, tc_payload_size, SEI_NAL_H265_PREFIX,
                          SEI_TYPE_TIME_CODE_HEVC, &tc_nal, &tc_nal_size);
       bfree(tc_payload);
+    }
+  } else if (codec_type == 0 && ntp_time) {
+    smpte_timecode_t tc;
+    ntp_to_smpte_timecode(ntp_time, fps_num, fps_den, &tc);
+    uint8_t *pt_payload = NULL;
+    size_t pt_payload_size = 0;
+    bool cpb_dpb = codec_info && codec_info->h264_cpb_dpb_delays_present;
+    uint8_t cpb_len = codec_info ? codec_info->h264_cpb_removal_delay_length : 0;
+    uint8_t dpb_len = codec_info ? codec_info->h264_dpb_output_delay_length : 0;
+    if (build_h264_pic_timing_sei_payload(&tc, cpb_dpb, cpb_len, dpb_len,
+                                          &pt_payload, &pt_payload_size)) {
+      build_sei_nal_unit(pt_payload, pt_payload_size, SEI_NAL_H264,
+                         SEI_TYPE_PIC_TIMING, &tc_nal, &tc_nal_size);
+      bfree(pt_payload);
     }
   }
 

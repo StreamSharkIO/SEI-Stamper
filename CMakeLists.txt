@@ -41,6 +41,7 @@ set(PLUGIN_SOURCES
     src/sei-stamper-plugin.c
     src/ntp-client.c
     src/sei-handler.c
+    src/h264-sps.c
     src/sei-stamper-encoder.c
     src/unified-encoder.c      # Unified Encoder Wrapper
     src/qsv-encoder.c          # Intel VPL Encoder

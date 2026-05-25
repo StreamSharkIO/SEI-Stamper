@@ -106,6 +106,27 @@ bool build_hevc_time_code_sei_payload(const smpte_timecode_t *tc,
                                       size_t *payload_size);
 
 /*
+ * Build an H.264 pic_timing SEI payload (ITU-T H.264 §D.1.2 / D.2.2) with
+ * pic_struct=0 (progressive frame), one clock timestamp,
+ * full_timestamp_flag=1, no time_offset.
+ *
+ * If the SPS advertises HRD parameters (CpbDpbDelaysPresentFlag = 1), the
+ * payload must begin with cpb_removal_delay (u(v)) + dpb_output_delay (u(v))
+ * fields of the lengths defined in the SPS. Pass cpb_dpb_delays_present=true
+ * and the field lengths in bits; we emit zero values for both. Pass false
+ * with zero lengths to omit the delay fields.
+ *
+ * Decoders only parse this SEI when SPS VUI has pic_struct_present_flag set;
+ * see h264-sps.c for the SPS patcher that ensures that.
+ */
+bool build_h264_pic_timing_sei_payload(const smpte_timecode_t *tc,
+                                       bool cpb_dpb_delays_present,
+                                       uint8_t cpb_removal_delay_length,
+                                       uint8_t dpb_output_delay_length,
+                                       uint8_t **payload_out,
+                                       size_t *payload_size);
+
+/*
  * Build the per-frame SEI NAL bundle for an encoded packet. The bundle is a
  * single bmalloc'd buffer containing zero or more concatenated Annex-B SEI
  * NALs in this order:
@@ -121,9 +142,22 @@ bool build_hevc_time_code_sei_payload(const smpte_timecode_t *tc,
  * codec_type: 0 = H.264, 1 = H.265, 2 = AV1
  * Returns false only on allocation failure.
  */
+/*
+ * Per-codec metadata the SEI bundler needs to emit a spec-valid timecode
+ * payload. Defaults (cpb_dpb_delays_present=false, lengths=0) work for any
+ * codec where HRD is not present; for H.264 with NVENC's default SPS, the
+ * caller should fill these from the SPS info returned by the patcher.
+ */
+typedef struct sei_bundle_codec_info {
+  bool h264_cpb_dpb_delays_present;
+  uint8_t h264_cpb_removal_delay_length; /* bits, 0 if delays absent */
+  uint8_t h264_dpb_output_delay_length;  /* bits, 0 if delays absent */
+} sei_bundle_codec_info_t;
+
 bool build_sei_bundle(int codec_type, bool is_keyframe,
                       int64_t pts, const ntp_timestamp_t *ntp_time,
                       uint32_t fps_num, uint32_t fps_den,
+                      const sei_bundle_codec_info_t *codec_info,
                       uint8_t **bundle_out, size_t *bundle_size);
 
 /*
