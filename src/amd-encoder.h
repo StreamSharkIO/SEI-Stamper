@@ -37,6 +37,13 @@ typedef struct amd_encoder {
   uint8_t *extra_data;
   size_t extra_data_size;
 
+  /* Inline parameter sets (Annex-B) re-injected at each keyframe when
+   * GLOBAL_HEADER is set for H.264 (so MPEG-TS/SRT receivers see SPS/PPS,
+   * with pic_struct_present_flag patched on). Empty for H.265, which emits
+   * parameter sets inline on its own. */
+  uint8_t *inline_params;
+  size_t inline_params_size;
+
   /* NTP 同步 */
   struct ntp_client ntp_client;
   uint64_t last_ntp_sync_time;

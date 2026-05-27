@@ -1,4 +1,5 @@
 #include "amd-encoder.h"
+#include "h264-sps.h"
 #include <util/dstr.h>
 #include <util/platform.h>
 
@@ -197,6 +198,8 @@ void amd_encoder_destroy(amd_encoder_t *enc) {
 
   if (enc->extra_data)
     bfree(enc->extra_data);
+  if (enc->inline_params)
+    bfree(enc->inline_params);
   if (enc->profile)
     bfree(enc->profile);
   if (enc->preset)
@@ -206,6 +209,29 @@ void amd_encoder_destroy(amd_encoder_t *enc) {
 
   ntp_client_destroy(&enc->ntp_client);
   bfree(enc);
+}
+
+/*
+ * Resolve the codec-appropriate profile string for FFmpeg's *_amf encoders.
+ * The unified-encoder UI exposes H.264 profile names (baseline/main/high) for
+ * all codecs, but hevc_amf accepts only "main" and av1_amf only "main".
+ * Passing "high" to hevc_amf returns EINVAL from avcodec_open2 — so we coerce
+ * unrecognised values to a sensible per-codec default.
+ *
+ * codec_type: 0 = H.264, 1 = H.265, 2 = AV1.
+ * Returns NULL to mean "do not set the profile option".
+ */
+static const char *amd_resolve_profile(int codec_type, const char *in) {
+  if (codec_type == 0) { /* h264_amf: baseline/main/high/constrained_* */
+    if (!in || !*in)
+      return "high";
+    return in;
+  }
+  if (codec_type == 1) /* hevc_amf: main only */
+    return "main";
+  if (codec_type == 2) /* av1_amf: main */
+    return "main";
+  return NULL;
 }
 
 /* 创建编码器 - Internal (public for unified encoder) */
@@ -288,7 +314,15 @@ void *amd_encoder_create_internal(obs_data_t *settings,
   enc->codec_context->bit_rate = enc->bitrate * 1000;
   enc->codec_context->gop_size = enc->keyint;
   enc->codec_context->max_b_frames = enc->bframes;
-  /* enc->codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER; */
+
+  /* For H.264 only: enable GLOBAL_HEADER so FFmpeg populates extradata with
+   * an SPS we can patch (pic_struct_present_flag) for pic_timing SEI. AMF
+   * H.265 already emits inline parameter sets and records/streams fine, so
+   * it's left as-is. We re-inject the patched SPS/PPS inline at each H.264
+   * keyframe below. */
+  if (enc->codec_type == 0) {
+    enc->codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+  }
 
   /* AMD AMF 特定选项 */
   AVDictionary *opts = NULL;
@@ -299,9 +333,14 @@ void *amd_encoder_create_internal(obs_data_t *settings,
     encoder_log(LOG_INFO, enc, "Using quality preset: %s", enc->preset);
   }
 
-  /* Profile */
-  if (enc->profile && strlen(enc->profile) > 0) {
-    av_dict_set(&opts, "profile", enc->profile, 0);
+  /* Profile (coerce to codec-valid value — the UI exposes H.264 names for all
+   * codecs, but hevc_amf/av1_amf reject "high" with EINVAL). */
+  const char *amf_profile = amd_resolve_profile(enc->codec_type, enc->profile);
+  if (amf_profile) {
+    av_dict_set(&opts, "profile", amf_profile, 0);
+    encoder_log(LOG_INFO, enc, "Using AMF profile: %s (requested: %s)",
+                amf_profile,
+                (enc->profile && *enc->profile) ? enc->profile : "(default)");
   }
 
   /* Rate control - CBR */
@@ -334,6 +373,37 @@ void *amd_encoder_create_internal(obs_data_t *settings,
            enc->extra_data_size);
     encoder_log(LOG_INFO, enc, "Extra data size: %zu bytes",
                 enc->extra_data_size);
+
+    /* For H.264, patch the SPS VUI to set pic_struct_present_flag so the
+     * pic_timing SEI we emit is parsed by decoders. The patcher takes and
+     * returns Annex-B, so the patched extradata doubles as the inline
+     * parameter-set payload we re-inject at every keyframe (AMF H.264 has no
+     * HRD, so the pic_timing payload needs no CPB/DPB delays). */
+    if (enc->codec_type == 0) {
+      uint8_t *patched = NULL;
+      size_t patched_size = 0;
+      h264_sps_info_t info = {0};
+      if (h264_sps_patch_pic_struct_present(enc->extra_data,
+                                            enc->extra_data_size, &patched,
+                                            &patched_size, &info)) {
+        bfree(enc->extra_data);
+        enc->extra_data = patched;
+        enc->extra_data_size = patched_size;
+        encoder_log(LOG_INFO, enc,
+                    "Patched H.264 SPS VUI (pic_struct_present_flag=1)");
+      } else if (info.parsed_ok) {
+        encoder_log(LOG_INFO, enc,
+                    "H.264 SPS VUI patch not needed (flag already set)");
+      } else {
+        encoder_log(LOG_WARNING, enc,
+                    "H.264 SPS parse/patch failed; pic_timing SEI may not "
+                    "surface as S12M_TIMECODE downstream");
+      }
+      /* inline_params = (patched) Annex-B SPS/PPS, re-injected at keyframes. */
+      enc->inline_params = bmalloc(enc->extra_data_size);
+      memcpy(enc->inline_params, enc->extra_data, enc->extra_data_size);
+      enc->inline_params_size = enc->extra_data_size;
+    }
   }
 
   encoder_log(LOG_INFO, enc,
@@ -408,74 +478,71 @@ bool amd_encoder_encode_internal(void *data, struct encoder_frame *frame,
   }
   ntp_client_get_time(&enc->ntp_client, &enc->current_ntp_time);
 
-  /* SEI 插入 (关键帧) */
+  /* Build per-frame SEI bundle: timecode SEI every frame (HEVC time_code /
+   * H.264 pic_timing) plus the UUID NTP SEI at keyframes. AMF emits inline
+   * parameter sets (no GLOBAL_HEADER needed), so the keyframe path splices the
+   * bundle in after them. codec_info is NULL for now — H.264 pic_timing HRD
+   * handling is wired in a follow-up; H.265 time_code needs none. */
   bool keyframe = (enc->packet->flags & AV_PKT_FLAG_KEY) != 0;
-  uint8_t *sei_nal = NULL;
-  size_t sei_nal_size = 0;
-
-  if (keyframe) {
-    uint8_t *payload = NULL;
-    size_t payload_size = 0;
-    if (build_ntp_sei_payload(frame->pts, &enc->current_ntp_time, &payload,
-                                  &payload_size)) {
-      sei_nal_type_t nal_type = (enc->codec_type == 1) ? SEI_NAL_H265_PREFIX : SEI_NAL_H264;
-      build_sei_nal_unit(payload, payload_size, nal_type,
-                         SEI_TYPE_USER_DATA_UNREGISTERED, &sei_nal,
-                         &sei_nal_size);
-      bfree(payload);
-
-      encoder_log(LOG_DEBUG, enc,
-                  "[AMD] Inserted SEI: PTS=%lld NTP=%u.%u Size=%zu", frame->pts,
-                  enc->current_ntp_time.seconds, enc->current_ntp_time.fraction,
-                  sei_nal_size);
-    }
-  }
+  uint8_t *sei_bundle = NULL;
+  size_t sei_bundle_size = 0;
+  build_sei_bundle(enc->codec_type, keyframe, frame->pts,
+                   &enc->current_ntp_time, (uint32_t)enc->fps_num,
+                   (uint32_t)enc->fps_den, NULL, &sei_bundle, &sei_bundle_size);
 
   /* 组装Packet with correct SEI insertion position */
-  size_t total_size = enc->packet->size + sei_nal_size;
+  size_t total_size = enc->packet->size + sei_bundle_size;
   if (enc->packet_buffer_size < total_size) {
     bfree(enc->packet_buffer);
     enc->packet_buffer = bmalloc(total_size);
     enc->packet_buffer_size = total_size;
   }
 
-  if (sei_nal && keyframe) {
-    /* 查找参数集结束位置 */
+  if (sei_bundle_size == 0) {
+    /* Nothing to splice in. */
+    memcpy(enc->packet_buffer, enc->packet->data, enc->packet->size);
+  } else if (keyframe) {
     size_t param_sets_end = find_parameter_sets_end_amd(
         enc->packet->data, enc->packet->size, enc->codec_type);
-
     if (param_sets_end > 0 && param_sets_end < enc->packet->size) {
-      /* 正确顺序: 参数集 → SEI → IDR slice */
-      /* 1. 复制参数集 */
+      /* Parameter sets emitted inline (H.265 path): params → bundle → slice. */
       memcpy(enc->packet_buffer, enc->packet->data, param_sets_end);
       size_t offset = param_sets_end;
-
-      /* 2. 插入SEI */
-      memcpy(enc->packet_buffer + offset, sei_nal, sei_nal_size);
-      offset += sei_nal_size;
-
-      /* 3. 复制剩余数据 */
-      size_t remaining = enc->packet->size - param_sets_end;
+      memcpy(enc->packet_buffer + offset, sei_bundle, sei_bundle_size);
+      offset += sei_bundle_size;
       memcpy(enc->packet_buffer + offset, enc->packet->data + param_sets_end,
-             remaining);
-
-      encoder_log(LOG_DEBUG, enc,
-                  "SEI inserted after parameter sets (offset: %zu)",
-                  param_sets_end);
+             enc->packet->size - param_sets_end);
+    } else if (enc->inline_params && enc->inline_params_size > 0) {
+      /* GLOBAL_HEADER path (H.264): FFmpeg dropped SPS/PPS from the packet;
+       * re-inject our patched SPS/PPS so MPEG-TS/SRT receivers decode and the
+       * pic_timing SEI parses. Order: SPS/PPS → SEI bundle → slice. */
+      total_size =
+          enc->inline_params_size + sei_bundle_size + enc->packet->size;
+      if (enc->packet_buffer_size < total_size) {
+        bfree(enc->packet_buffer);
+        enc->packet_buffer = bmalloc(total_size);
+        enc->packet_buffer_size = total_size;
+      }
+      memcpy(enc->packet_buffer, enc->inline_params, enc->inline_params_size);
+      size_t offset = enc->inline_params_size;
+      memcpy(enc->packet_buffer + offset, sei_bundle, sei_bundle_size);
+      offset += sei_bundle_size;
+      memcpy(enc->packet_buffer + offset, enc->packet->data, enc->packet->size);
     } else {
-      /* Fallback到旧行为 */
-      encoder_log(LOG_WARNING, enc,
-                  "Could not find parameter sets end, inserting SEI at "
-                  "beginning (may cause decoding issues)");
-      memcpy(enc->packet_buffer, sei_nal, sei_nal_size);
-      memcpy(enc->packet_buffer + sei_nal_size, enc->packet->data,
+      /* Fallback: SEI bundle before slice. */
+      memcpy(enc->packet_buffer, sei_bundle, sei_bundle_size);
+      memcpy(enc->packet_buffer + sei_bundle_size, enc->packet->data,
              enc->packet->size);
     }
-
-    bfree(sei_nal);
   } else {
-    /* 非关键帧或无SEI */
-    memcpy(enc->packet_buffer, enc->packet->data, enc->packet->size);
+    /* Non-keyframe with bundle (per-frame timecode): SEI bundle → slice. */
+    memcpy(enc->packet_buffer, sei_bundle, sei_bundle_size);
+    memcpy(enc->packet_buffer + sei_bundle_size, enc->packet->data,
+           enc->packet->size);
+  }
+
+  if (sei_bundle) {
+    bfree(sei_bundle);
   }
 
   packet->data = enc->packet_buffer;
