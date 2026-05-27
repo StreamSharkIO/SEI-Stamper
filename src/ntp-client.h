@@ -47,9 +47,10 @@ typedef struct ntp_client {
   bool is_initialized; /* 是否已初始化 */
   bool is_synced;      /* 是否已同步 */
 
-  ntp_timestamp_t last_sync_time; /* 最后同步的NTP时间 */
-  uint64_t last_sync_local_time;  /* 最后同步时的本地时间(os_gettime_ns) */
-  int64_t time_offset_ns;         /* 时间偏移(纳秒) */
+  uint64_t last_sync_mono;        /* monotonic clock (os_gettime_ns) at last sync,
+                                     for resync-age tracking */
+  int64_t time_offset_ns;         /* NTP offset vs system wall clock (ns);
+                                     0 when unsynced → system clock used as-is */
 
   uint32_t sync_count;  /* 同步次数 */
   uint32_t error_count; /* 错误次数 */

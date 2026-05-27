@@ -8,6 +8,7 @@
 #include "ntp-client.h"
 #include <obs-module.h>
 #include <string.h>
+#include <time.h>
 #include <util/platform.h>
 
 #ifdef _WIN32
@@ -39,8 +40,28 @@ static uint32_t ntohl_swap(uint32_t netlong) { return ntohl(netlong); }
 /* 辅助函数:将主机字节序转换为网络字节序 */
 static uint32_t htonl_swap(uint32_t hostlong) { return htonl(hostlong); }
 
-/* 辅助函数:获取当前时间(纳秒) */
-static uint64_t get_current_time_ns(void) { return os_gettime_ns(); }
+/* 辅助函数:获取单调时钟(纳秒) — 仅用于测量间隔,不是墙上时钟 */
+static uint64_t get_monotonic_ns(void) { return os_gettime_ns(); }
+
+/* Get the system wall-clock time as nanoseconds since the Unix epoch (1970).
+ * This is the OS clock, which on Windows/Linux is already disciplined by the
+ * OS's own NTP service — so it serves as both the NTP round-trip reference
+ * and the fallback when our own NTP query fails. */
+static uint64_t get_system_wallclock_ns(void) {
+#ifdef _WIN32
+  FILETIME ft;
+  GetSystemTimePreciseAsFileTime(&ft);
+  uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | (uint64_t)ft.dwLowDateTime;
+  /* FILETIME is 100ns ticks since 1601-01-01; 116444736000000000 ticks
+   * separate 1601 from 1970. */
+  t -= 116444736000000000ULL;
+  return t * 100ULL;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
 
 /* 辅助函数:将NTP时间戳转换为纳秒 */
 static uint64_t ntp_to_ns(ntp_timestamp_t *ntp) {
@@ -132,9 +153,12 @@ bool ntp_client_sync(ntp_client_t *client) {
   ntp_packet_t packet;
   bool success = false;
 
-  /* 创建UDP socket */
+  /* 创建UDP socket. Force IPv4 — AF_UNSPEC can hand back an IPv6 address
+   * first, and on networks with a broken IPv6 UDP path the reply never
+   * arrives (sendto succeeds locally, recvfrom then fails fast with
+   * WSAECONNRESET from an ICMP unreachable). IPv4 NTP is universal. */
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC; /* IPv4或IPv6 */
+  hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
 
   char port_str[16];
@@ -154,20 +178,32 @@ bool ntp_client_sync(ntp_client_t *client) {
     goto cleanup;
   }
 
-  /* 设置超时 */
+  /* 设置接收超时. NOTE: Windows SO_RCVTIMEO takes a DWORD of milliseconds,
+   * NOT a struct timeval — passing a timeval makes Windows read tv_sec(=5)
+   * as 5 milliseconds, which is far too short for a network round-trip and
+   * causes a spurious WSAETIMEDOUT. Use the correct type per platform. */
+#ifdef _WIN32
+  DWORD timeout_ms = 3000;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms,
+             sizeof(timeout_ms));
+#else
   struct timeval timeout;
-  timeout.tv_sec = 5;
+  timeout.tv_sec = 3;
   timeout.tv_usec = 0;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
              sizeof(timeout));
+#endif
 
   /* 构建NTP请求包 */
   memset(&packet, 0, sizeof(packet));
   packet.li_vn_mode = (0 << 6) | (NTP_VERSION << 3) | NTP_MODE_CLIENT;
 
-  /* 记录发送时间 (T1) */
-  uint64_t t1 = get_current_time_ns();
-  ns_to_ntp(t1, &packet.transmit_timestamp);
+  /* Send time (T1), measured against the system wall clock so the offset
+   * calculation below is dimensionally consistent with the server's
+   * wall-clock T2/T3. (We separately keep a monotonic reference for
+   * interpolating between syncs — see last_sync_mono.) */
+  uint64_t t1_ns = get_system_wallclock_ns();
+  ns_to_ntp(t1_ns, &packet.transmit_timestamp);
   packet.transmit_timestamp.seconds =
       htonl_swap(packet.transmit_timestamp.seconds);
   packet.transmit_timestamp.fraction =
@@ -187,11 +223,22 @@ bool ntp_client_sync(ntp_client_t *client) {
   ret = recvfrom(sock, (char *)&packet, sizeof(packet), 0,
                  (struct sockaddr *)&from_addr, &from_len);
 
-  /* 记录接收时间 (T4) */
-  uint64_t t4 = get_current_time_ns();
+  /* Receive time (T4), and monotonic reference for inter-sync interpolation. */
+  uint64_t t4_ns = get_system_wallclock_ns();
+  uint64_t t4_mono = get_monotonic_ns();
 
-  if (ret < sizeof(packet)) {
-    ntp_log(LOG_ERROR, "recvfrom failed or incomplete packet");
+  /* Detect failure FIRST. recvfrom returns -1 on error; comparing a signed
+   * -1 against the unsigned sizeof() would wrongly pass, so check the sign
+   * explicitly. A short read is also invalid for a 48-byte NTP packet. */
+  if (ret <= 0 || (size_t)ret < sizeof(packet)) {
+#ifdef _WIN32
+    ntp_log(LOG_WARNING,
+            "recvfrom failed (ret=%d, WSA=%d); falling back to system clock",
+            ret, WSAGetLastError());
+#else
+    ntp_log(LOG_WARNING,
+            "recvfrom failed (ret=%d); falling back to system clock", ret);
+#endif
     goto cleanup;
   }
 
@@ -202,21 +249,31 @@ bool ntp_client_sync(ntp_client_t *client) {
   t3.seconds = ntohl_swap(packet.transmit_timestamp.seconds);
   t3.fraction = ntohl_swap(packet.transmit_timestamp.fraction);
 
+  /* Sanity check: a real NTP timestamp is well past the epoch delta. If the
+   * server echoed our originate (or sent garbage), reject it. */
+  if (t3.seconds < NTP_TIMESTAMP_DELTA) {
+    ntp_log(LOG_WARNING,
+            "NTP response implausible (T3 seconds=%u < epoch delta); "
+            "falling back to system clock", t3.seconds);
+    goto cleanup;
+  }
+
   uint64_t t2_ns = ntp_to_ns(&t2);
   uint64_t t3_ns = ntp_to_ns(&t3);
 
-  /* 计算时间偏移: offset = ((T2 - T1) + (T3 - T4)) / 2 */
-  int64_t offset = ((int64_t)(t2_ns - t1) + (int64_t)(t3_ns - t4)) / 2;
+  /* Clock offset (server - local), all wall-clock ns:
+   *   offset = ((T2 - T1) + (T3 - T4)) / 2 */
+  int64_t offset = ((int64_t)(t2_ns - t1_ns) + (int64_t)(t3_ns - t4_ns)) / 2;
 
   /* 更新客户端状态 */
   client->time_offset_ns = offset;
-  client->last_sync_local_time = t4;
-  client->last_sync_time = t3;
+  client->last_sync_mono = t4_mono;
   client->is_synced = true;
   client->sync_count++;
 
-  ntp_log(LOG_INFO, "NTP sync successful (offset: %lld ms, count: %u)",
-          offset / 1000000, client->sync_count);
+  ntp_log(LOG_INFO,
+          "NTP sync successful (offset: %lld ms vs system clock, count: %u)",
+          (long long)(offset / 1000000), client->sync_count);
 
   success = true;
 
@@ -239,20 +296,23 @@ cleanup:
   return success;
 }
 
-/* 获取当前的NTP时间戳 */
+/* 获取当前的NTP时间戳
+ *
+ * Always succeeds: returns the system wall clock corrected by the NTP offset
+ * when we have one. If our NTP query never succeeded, the offset is 0 and we
+ * return the system clock directly — which on Windows/Linux is itself
+ * NTP-disciplined by the OS, so it's a correct wall-clock fallback rather
+ * than garbage. */
 bool ntp_client_get_time(ntp_client_t *client, ntp_timestamp_t *timestamp) {
-  if (!client || !timestamp || !client->is_synced) {
+  if (!client || !timestamp) {
     return false;
   }
 
-  /* 计算当前NTP时间 = 最后同步时间 + (当前本地时间 - 最后同步本地时间) + 偏移
-   */
-  uint64_t current_local = get_current_time_ns();
-  uint64_t elapsed = current_local - client->last_sync_local_time;
-  uint64_t current_ntp_ns = ntp_to_ns(&client->last_sync_time) + elapsed;
+  uint64_t now_wall_ns = get_system_wallclock_ns();
+  int64_t offset = client->is_synced ? client->time_offset_ns : 0;
+  uint64_t corrected_ns = (uint64_t)((int64_t)now_wall_ns + offset);
 
-  ns_to_ntp(current_ntp_ns, timestamp);
-
+  ns_to_ntp(corrected_ns, timestamp);
   return true;
 }
 
@@ -270,8 +330,8 @@ bool ntp_client_needs_resync(ntp_client_t *client, uint32_t max_age_seconds) {
     return true;
   }
 
-  uint64_t current = get_current_time_ns();
-  uint64_t age_ns = current - client->last_sync_local_time;
+  uint64_t current = get_monotonic_ns();
+  uint64_t age_ns = current - client->last_sync_mono;
   uint64_t max_age_ns = (uint64_t)max_age_seconds * 1000000000ULL;
 
   return age_ns > max_age_ns;
