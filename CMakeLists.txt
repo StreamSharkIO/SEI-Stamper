@@ -27,8 +27,8 @@ set(PLUGIN_SOURCES
 )
 
 if(APPLE)
-    # macOS: add VideoToolbox encoder, exclude Windows-only files
-    list(APPEND PLUGIN_SOURCES src/videotoolbox-encoder.c)
+    # macOS: add VideoToolbox encoder and timecode renderer
+    list(APPEND PLUGIN_SOURCES src/videotoolbox-encoder.c src/timecode-render.c)
     # Stubs for disabled encoders (their .c files have #ifdef guards that
     # produce empty translation units, but we still compile them for the
     # extern struct obs_encoder_info symbols)

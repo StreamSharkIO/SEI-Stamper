@@ -456,6 +456,8 @@ void unified_encoder_get_defaults_h264(obs_data_t *settings) {
 #endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms", 60000);
+  obs_data_set_default_bool(settings, "burn_in_timecode", false);
+  obs_data_set_default_int(settings, "timecode_position", 0);
 }
 
 /* 获取默认设置 - H.265专用 */
@@ -480,6 +482,8 @@ void unified_encoder_get_defaults_h265(obs_data_t *settings) {
 #endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms", 60000);
+  obs_data_set_default_bool(settings, "burn_in_timecode", false);
+  obs_data_set_default_int(settings, "timecode_position", 0);
 }
 
 /* 获取默认设置 - AV1专用 */
@@ -504,6 +508,8 @@ void unified_encoder_get_defaults_av1(obs_data_t *settings) {
 #endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms", 60000);
+  obs_data_set_default_bool(settings, "burn_in_timecode", false);
+  obs_data_set_default_int(settings, "timecode_position", 0);
 }
 
 /*===========================================================================
@@ -595,6 +601,17 @@ obs_properties_t *unified_encoder_properties(void *unused) {
   obs_properties_add_int(props, "ntp_port", "NTP Port", 1, 65535, 1);
   obs_properties_add_int(props, "ntp_sync_interval_ms",
                          "NTP Sync Interval (ms)", 1000, 300000, 1000);
+
+  obs_properties_add_bool(props, "burn_in_timecode", "Burn in NTP Timecode");
+  obs_property_t *pos_list = obs_properties_add_list(
+      props, "timecode_position", "Timecode Position",
+      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+  obs_property_list_add_int(pos_list, "Top Left", 0);
+  obs_property_list_add_int(pos_list, "Top Center", 1);
+  obs_property_list_add_int(pos_list, "Top Right", 2);
+  obs_property_list_add_int(pos_list, "Bottom Left", 3);
+  obs_property_list_add_int(pos_list, "Bottom Center", 4);
+  obs_property_list_add_int(pos_list, "Bottom Right", 5);
 
   return props;
 }

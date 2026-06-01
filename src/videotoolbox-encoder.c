@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "sei-handler.h"
+#include "timecode-render.h"
 
 #define encoder_log(level, enc, format, ...)                                   \
   blog(level, "[VT Encoder: '%s'] " format,                                   \
@@ -271,6 +272,9 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
   if (enc->ntp_sync_interval_ms == 0)
     enc->ntp_sync_interval_ms = 60000;
 
+  enc->burn_in_timecode = obs_data_get_bool(settings, "burn_in_timecode");
+  enc->timecode_position = (int)obs_data_get_int(settings, "timecode_position");
+
   const char *encoder_name =
       is_hardware ? "h264_videotoolbox" : "libx264";
   encoder_log(LOG_INFO, enc, "Creating %s encoder", encoder_name);
@@ -406,6 +410,18 @@ bool vt_encoder_encode_internal(void *data, struct encoder_frame *frame,
   if (!frame || !packet || !received_packet)
     return false;
 
+  /* NTP time update — captured before frame submission so the burn-in
+   * and SEI bundle use the same timestamp for this frame. */
+  uint64_t now = os_gettime_ns();
+  uint64_t sync_interval_ns =
+      (uint64_t)enc->ntp_sync_interval_ms * 1000000ULL;
+  if (enc->last_ntp_sync_time == 0 ||
+      (now - enc->last_ntp_sync_time) > sync_interval_ns) {
+    enc->last_ntp_sync_time = now;
+    ntp_client_sync(&enc->ntp_client);
+  }
+  ntp_client_get_time(&enc->ntp_client, &enc->current_ntp_time);
+
   av_frame_unref(enc->frame);
 
   enc->frame->format = enc->codec_context->pix_fmt;
@@ -431,6 +447,19 @@ bool vt_encoder_encode_internal(void *data, struct encoder_frame *frame,
     return false;
   }
 
+  if (enc->burn_in_timecode) {
+    timecode_frame_t tc_frame = {
+        .data = {frame->data[0], frame->data[1], frame->data[2]},
+        .linesize = {frame->linesize[0], frame->linesize[1], frame->linesize[2]},
+        .width = enc->width,
+        .height = enc->height,
+        .pixfmt = (enc->codec_context->pix_fmt == AV_PIX_FMT_NV12)
+                      ? TC_PIX_NV12 : TC_PIX_YUV420P,
+    };
+    timecode_render_draw(&enc->current_ntp_time, &tc_frame,
+                         (timecode_position_t)enc->timecode_position);
+  }
+
   int ret = avcodec_send_frame(enc->codec_context, enc->frame);
   av_frame_unref(enc->frame);
 
@@ -453,17 +482,6 @@ bool vt_encoder_encode_internal(void *data, struct encoder_frame *frame,
   }
 
   *received_packet = true;
-
-  /* NTP time update */
-  uint64_t now = os_gettime_ns();
-  uint64_t sync_interval_ns =
-      (uint64_t)enc->ntp_sync_interval_ms * 1000000ULL;
-  if (enc->last_ntp_sync_time == 0 ||
-      (now - enc->last_ntp_sync_time) > sync_interval_ns) {
-    enc->last_ntp_sync_time = now;
-    ntp_client_sync(&enc->ntp_client);
-  }
-  ntp_client_get_time(&enc->ntp_client, &enc->current_ntp_time);
 
   /* Build SEI bundle (H.264 only, codec_type=0) */
   bool keyframe = (enc->packet->flags & AV_PKT_FLAG_KEY) != 0;

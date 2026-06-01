@@ -56,6 +56,10 @@ typedef struct vt_encoder {
   bool ntp_enabled;
   uint32_t ntp_sync_interval_ms;
 
+  /* Timecode burn-in */
+  bool burn_in_timecode;
+  int timecode_position;
+
   /* Packet buffer */
   uint8_t *packet_buffer;
   size_t packet_buffer_size;
