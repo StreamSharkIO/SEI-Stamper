@@ -4,9 +4,19 @@ project(sei-stamper VERSION 1.2.2)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# Optional: CI passes version from git tag
+if(DEFINED PLUGIN_VERSION)
+    set(PROJECT_VERSION "${PLUGIN_VERSION}")
+endif()
+
 # --- OBS Studio ---
+if(NOT DEFINED OBS_SOURCE_DIR)
+    set(OBS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master"
+        CACHE PATH "OBS source tree (for headers)")
+endif()
+
 if(NOT DEFINED OBS_DIR)
-    set(OBS_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/build/rundir/Release"
+    set(OBS_DIR "${OBS_SOURCE_DIR}/build/rundir/Release"
         CACHE PATH "OBS installation directory")
 endif()
 list(APPEND CMAKE_MODULE_PATH "${OBS_DIR}/../cmake")
@@ -55,20 +65,25 @@ if(APPLE)
         pkg_check_modules(FFMPEG QUIET libavcodec libavformat libavutil)
     endif()
 
+    if(NOT DEFINED OBS_APP_DIR)
+        set(OBS_APP_DIR "/Applications/OBS.app"
+            CACHE PATH "Path to OBS.app (for linking libobs framework)")
+    endif()
+
     # OBS headers from source tree
-    set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
+    set(LIBOBS_INCLUDE_DIR "${OBS_SOURCE_DIR}/libobs")
 
     if(NOT FFMPEG_FOUND)
         # Try OBS source tree deps
         file(GLOB OBS_DEPS_DIRS
-             "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-universal")
+             "${OBS_SOURCE_DIR}/.deps/obs-deps-*-universal")
         if(NOT OBS_DEPS_DIRS)
             file(GLOB OBS_DEPS_DIRS
-                 "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-arm64")
+                 "${OBS_SOURCE_DIR}/.deps/obs-deps-*-arm64")
         endif()
         if(NOT OBS_DEPS_DIRS)
             file(GLOB OBS_DEPS_DIRS
-                 "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-x86_64")
+                 "${OBS_SOURCE_DIR}/.deps/obs-deps-*-x86_64")
         endif()
         list(SORT OBS_DEPS_DIRS)
         list(REVERSE OBS_DEPS_DIRS)
@@ -87,7 +102,8 @@ if(APPLE)
     target_include_directories(sei-stamper PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${LIBOBS_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/obs-studio-master/build/config
+        ${OBS_SOURCE_DIR}/build/config
+        ${OBS_SOURCE_DIR}/libobs
         ${FFMPEG_INCLUDE_DIRS}
         ${SIMDE_INCLUDE_DIR}
     )
@@ -95,9 +111,9 @@ if(APPLE)
     # Link OBS
     if(NOT libobs_FOUND)
         find_library(LIBOBS_LIBRARY libobs
-            PATHS "/Applications/OBS.app/Contents/Frameworks"
+            PATHS "${OBS_APP_DIR}/Contents/Frameworks"
                   "${OBS_DIR}/lib" "${OBS_DIR}/bin"
-                  "${CMAKE_SOURCE_DIR}/obs-studio-master/build/libobs")
+                  "${OBS_SOURCE_DIR}/build/libobs")
         if(LIBOBS_LIBRARY)
             message(STATUS "Found libobs: ${LIBOBS_LIBRARY}")
             target_link_libraries(sei-stamper ${LIBOBS_LIBRARY})
@@ -129,9 +145,8 @@ if(APPLE)
 elseif(WIN32)
     # === Windows: original configuration (unchanged) ===
     if(NOT libobs_FOUND)
-        set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
-        set(LIBOBS_LIB_DIR
-            "${CMAKE_SOURCE_DIR}/obs-studio-master/build/libobs/Release")
+        set(LIBOBS_INCLUDE_DIR "${OBS_SOURCE_DIR}/libobs")
+        set(LIBOBS_LIB_DIR "${OBS_DIR}/lib")
         set(LIBOBS_BIN_DIR "${OBS_DIR}/bin/64bit")
         add_library(OBS::libobs SHARED IMPORTED)
         set_target_properties(OBS::libobs PROPERTIES
@@ -141,27 +156,28 @@ elseif(WIN32)
         )
     endif()
 
-    find_library(PTHREAD_LIBRARY NAMES w32-pthreads
-        PATHS
-        "${CMAKE_SOURCE_DIR}/obs-studio-master/build/deps/w32-pthreads/Release"
-        "${CMAKE_SOURCE_DIR}/obs-studio-master/build/deps/w32-pthreads/Debug"
-    )
-
     find_package(PkgConfig)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(FFMPEG QUIET libavcodec libavformat libavutil libswscale)
     endif()
 
     file(GLOB OBS_DEPS_DIRS
-         "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-20??-??-??-x64")
+         "${OBS_SOURCE_DIR}/.deps/obs-deps-20??-??-??-x64")
     list(SORT OBS_DEPS_DIRS)
     list(REVERSE OBS_DEPS_DIRS)
     if(OBS_DEPS_DIRS)
         list(GET OBS_DEPS_DIRS 0 LATEST_OBS_DEPS_DIR)
     else()
         set(LATEST_OBS_DEPS_DIR
-            "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-2025-08-23-x64")
+            "${OBS_SOURCE_DIR}/.deps/obs-deps-2025-08-23-x64")
     endif()
+
+    find_library(PTHREAD_LIBRARY NAMES w32-pthreads
+        PATHS
+        "${OBS_SOURCE_DIR}/build/deps/w32-pthreads/Release"
+        "${OBS_SOURCE_DIR}/build/deps/w32-pthreads/Debug"
+        "${LATEST_OBS_DEPS_DIR}/lib"
+    )
 
     if(NOT FFMPEG_FOUND)
         set(FFMPEG_INCLUDE_DIRS "${LATEST_OBS_DEPS_DIR}/include")
@@ -174,8 +190,9 @@ elseif(WIN32)
     target_include_directories(sei-stamper PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${LIBOBS_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/obs-studio-master/build/config
-        ${CMAKE_SOURCE_DIR}/obs-studio-master/deps/w32-pthreads
+        ${OBS_SOURCE_DIR}/build/config
+        ${OBS_SOURCE_DIR}/libobs
+        ${OBS_SOURCE_DIR}/deps/w32-pthreads
         ${FFMPEG_INCLUDE_DIRS}
     )
 
