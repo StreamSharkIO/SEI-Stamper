@@ -226,14 +226,30 @@ elseif(WIN32)
 endif()
 
 # --- Output ---
-set_target_properties(sei-stamper PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
-)
+if(APPLE)
+    set_target_properties(sei-stamper PROPERTIES
+        BUNDLE TRUE
+        BUNDLE_EXTENSION "plugin"
+        MACOSX_BUNDLE_BUNDLE_NAME "sei-stamper"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.streamshark.sei-stamper"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/macos/Info.plist.in"
+        PREFIX ""
+        SUFFIX ""
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
+    )
+else()
+    set_target_properties(sei-stamper PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
+    )
+endif()
 
 install(TARGETS sei-stamper
     LIBRARY DESTINATION obs-plugins/64bit
     RUNTIME DESTINATION obs-plugins/64bit
+    BUNDLE DESTINATION obs-plugins
 )
 
 install(DIRECTORY data/
