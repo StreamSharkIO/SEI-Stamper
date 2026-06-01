@@ -51,8 +51,8 @@ jobs:
       - name: Download OBS deps
         run: |
           curl -sL "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/macos-deps-${{ env.OBS_DEPS_VERSION }}-universal.tar.xz" -o obs-deps.tar.xz
-          mkdir -p obs-studio-${{ env.OBS_VERSION }}/.deps
-          tar xJf obs-deps.tar.xz -C obs-studio-${{ env.OBS_VERSION }}/.deps/
+          mkdir -p obs-studio-${{ env.OBS_VERSION }}/.deps/obs-deps-${{ env.OBS_DEPS_VERSION }}-universal
+          tar xJf obs-deps.tar.xz -C obs-studio-${{ env.OBS_VERSION }}/.deps/obs-deps-${{ env.OBS_DEPS_VERSION }}-universal/
 
       - name: Configure
         run: |
