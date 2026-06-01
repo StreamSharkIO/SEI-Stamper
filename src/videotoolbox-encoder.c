@@ -334,6 +334,11 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
 
     if (enc->profile && *enc->profile)
       av_dict_set(&opts, "profile", enc->profile, 0);
+
+    /* Force VUI with HRD parameters in the SPS so the SPS patcher can
+     * set pic_struct_present_flag=1. Without this, x264 emits an SPS
+     * with no VUI, and decoders won't parse pic_timing SEI timecodes. */
+    av_dict_set(&opts, "nal-hrd", "cbr", 0);
   }
 
   char errbuf[128];
@@ -353,18 +358,31 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
   enc->frame = av_frame_alloc();
   enc->packet = av_packet_alloc();
 
-  /* Extract and process extra data */
+  /* Extract and process extra data.
+   * VideoToolbox emits AVCC-format extradata (length-prefixed); x264 emits
+   * Annex-B (start-code-prefixed). The SPS patcher requires Annex-B, so
+   * convert first, then patch, then use the patched Annex-B as both the
+   * extra_data returned to OBS and the inline parameter sets. */
   if (enc->codec_context->extradata_size > 0) {
-    enc->extra_data_size = enc->codec_context->extradata_size;
-    enc->extra_data = bmalloc(enc->extra_data_size);
-    memcpy(enc->extra_data, enc->codec_context->extradata,
-           enc->extra_data_size);
+    uint8_t *annexb = vt_extradata_to_annexb(
+        enc->codec_context->extradata,
+        (size_t)enc->codec_context->extradata_size,
+        &enc->extra_data_size);
+    if (annexb && enc->extra_data_size > 0) {
+      enc->extra_data = annexb;
+    } else {
+      enc->extra_data_size = enc->codec_context->extradata_size;
+      enc->extra_data = bmalloc(enc->extra_data_size);
+      memcpy(enc->extra_data, enc->codec_context->extradata,
+             enc->extra_data_size);
+    }
 
     vt_patch_h264_sps_vui(enc, &enc->extra_data, &enc->extra_data_size);
 
-    enc->inline_params = vt_extradata_to_annexb(
-        enc->extra_data, enc->extra_data_size, &enc->inline_params_size);
-    if (enc->inline_params && enc->inline_params_size > 0) {
+    enc->inline_params_size = enc->extra_data_size;
+    enc->inline_params = bmalloc(enc->inline_params_size);
+    memcpy(enc->inline_params, enc->extra_data, enc->inline_params_size);
+    if (enc->inline_params_size > 0) {
       encoder_log(LOG_INFO, enc,
                   "Inline parameter set payload built: %zu bytes",
                   enc->inline_params_size);

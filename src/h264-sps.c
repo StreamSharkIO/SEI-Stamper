@@ -106,19 +106,39 @@ static size_t epb_encode(const uint8_t *in, size_t in_size, uint8_t *out) {
   return op;
 }
 
+/* ---------- Bit writer (for VUI injection) ---------- */
+
+/* Insert `nbits` from `value` (MSB-first) into `buf` at bit position `*cursor`,
+ * advancing the cursor. buf must be large enough. */
+static void bw_put_bits(uint8_t *buf, size_t *cursor, uint32_t value, int nbits) {
+  for (int i = nbits - 1; i >= 0; i--) {
+    uint8_t b = (uint8_t)((value >> i) & 1u);
+    buf[*cursor >> 3] |= (uint8_t)(b << (7 - (*cursor & 7)));
+    (*cursor)++;
+  }
+}
+
 /* ---------- SPS navigator ---------- */
 
-/* Walk the SODB (NAL header byte + decoded RBSP body) to the bit position of
- * pic_struct_present_flag in the SPS VUI. Returns the absolute bit position
- * within `sodb`, or 0 on failure. Bails out on:
+/* Result codes from find_pic_struct_present_position. */
+typedef enum {
+  SPS_FIND_ERROR = 0,     /* parse failure */
+  SPS_FIND_VUI_PRESENT,   /* VUI exists; bit_pos_out points at pic_struct_present_flag */
+  SPS_FIND_NO_VUI,        /* VUI absent; bit_pos_out points at vui_parameters_present_flag (=0) */
+} sps_find_result_t;
+
+/* Walk the SODB (NAL header byte + decoded RBSP body) to find either the
+ * pic_struct_present_flag (when VUI exists) or the vui_parameters_present_flag
+ * (when VUI is absent). Bails out on:
  *   - scaling matrix in SPS (would require full scaling-list parsing)
- *   - NAL HRD or VCL HRD parameters in VUI (would require hrd_parameters parser)
- *   - VUI not present (we don't synthesise one — would shift later bits)
  *   - parser hit truncated data
  *
- * On success, *current_value receives the existing value of the flag (0 or 1).
+ * On SPS_FIND_VUI_PRESENT, *bit_pos_out is the position of pic_struct_present_flag
+ * and *current_value is its value. On SPS_FIND_NO_VUI, *bit_pos_out is the
+ * position of vui_parameters_present_flag (which is 0).
  */
-static bool find_pic_struct_present_position(const uint8_t *sodb,
+static sps_find_result_t find_pic_struct_present_position(
+                                             const uint8_t *sodb,
                                              size_t sodb_size,
                                              size_t *bit_pos_out,
                                              uint32_t *current_value,
@@ -196,12 +216,18 @@ static bool find_pic_struct_present_position(const uint8_t *sodb,
     br_read_ue(&br); /* frame_crop_bottom_offset */
   }
 
+  size_t vui_flag_pos = br.bit_pos;
   uint32_t vui_present = br_read_bits(&br, 1);
   if (!vui_present) {
-    blog(LOG_WARNING,
-         "[H.264 SPS patch] VUI not present — patcher bails out "
-         "(would need to inject one and shift subsequent bits)");
-    return false;
+    blog(LOG_INFO,
+         "[H.264 SPS patch] VUI not present at bit %zu — will inject "
+         "minimal VUI", vui_flag_pos);
+    *bit_pos_out = vui_flag_pos;
+    *current_value = 0;
+    *cpb_dpb_delays_present_out = false;
+    *cpb_removal_delay_length_out = 0;
+    *dpb_output_delay_length_out = 0;
+    return SPS_FIND_NO_VUI;
   }
 
   /* --- VUI parameters --- */
@@ -279,7 +305,7 @@ static bool find_pic_struct_present_position(const uint8_t *sodb,
     blog(LOG_WARNING,
          "[H.264 SPS patch] bit reader error before reaching "
          "pic_struct_present_flag (truncated/malformed SPS?)");
-    return false;
+    return SPS_FIND_ERROR;
   }
 
   /* Next bit is pic_struct_present_flag. Record position and read its value. */
@@ -289,7 +315,7 @@ static bool find_pic_struct_present_position(const uint8_t *sodb,
     blog(LOG_WARNING,
          "[H.264 SPS patch] bit reader error reading "
          "pic_struct_present_flag at bit %zu", pos);
-    return false;
+    return SPS_FIND_ERROR;
   }
 
   blog(LOG_INFO,
@@ -298,7 +324,7 @@ static bool find_pic_struct_present_position(const uint8_t *sodb,
 
   *bit_pos_out = pos;
   *current_value = value;
-  return true;
+  return SPS_FIND_VUI_PRESENT;
 }
 
 /* ---------- Public entry point ---------- */
@@ -377,10 +403,10 @@ bool h264_sps_patch_pic_struct_present(const uint8_t *in, size_t in_size,
   uint32_t flag_current = 0;
   bool cpb_dpb_delays_present = false;
   uint8_t cpb_len = 0, dpb_len = 0;
-  bool ok = find_pic_struct_present_position(
+  sps_find_result_t find_result = find_pic_struct_present_position(
       sodb, sodb_size, &flag_bit_pos, &flag_current,
       &cpb_dpb_delays_present, &cpb_len, &dpb_len);
-  if (!ok) {
+  if (find_result == SPS_FIND_ERROR) {
     bfree(sodb);
     return false;
   }
@@ -392,27 +418,107 @@ bool h264_sps_patch_pic_struct_present(const uint8_t *in, size_t in_size,
     info_out->dpb_output_delay_length = dpb_len;
   }
 
-  if (flag_current == 1) {
-    /* Already set — nothing to do. */
+  if (find_result == SPS_FIND_VUI_PRESENT && flag_current == 1) {
     blog(LOG_INFO,
          "[H.264 SPS patch] pic_struct_present_flag already set in SPS");
     bfree(sodb);
     return false;
   }
 
-  /* Set the bit to 1. */
-  sodb[flag_bit_pos >> 3] |=
-      (uint8_t)(1u << (7 - (flag_bit_pos & 7)));
+  /* We need to produce a patched SODB. Two cases:
+   *
+   * SPS_FIND_VUI_PRESENT: VUI exists but pic_struct_present_flag=0.
+   *   → flip the single bit at flag_bit_pos from 0 to 1.
+   *
+   * SPS_FIND_NO_VUI: vui_parameters_present_flag=0 at flag_bit_pos.
+   *   → flip that bit to 1, then splice in a 9-bit minimal VUI body
+   *     immediately after it. The minimal VUI per H.264 §E.1.1:
+   *       aspect_ratio_info_present_flag  = 0   (1 bit)
+   *       overscan_info_present_flag      = 0   (1 bit)
+   *       video_signal_type_present_flag  = 0   (1 bit)
+   *       chroma_loc_info_present_flag    = 0   (1 bit)
+   *       timing_info_present_flag        = 0   (1 bit)
+   *       nal_hrd_parameters_present_flag = 0   (1 bit)
+   *       vcl_hrd_parameters_present_flag = 0   (1 bit)
+   *       pic_struct_present_flag         = 1   (1 bit)
+   *       bitstream_restriction_flag      = 0   (1 bit)
+   *     No HRD → cpb_dpb_delays_present remains false.
+   */
+
+  uint8_t *new_sodb = NULL;
+  size_t new_sodb_size = 0;
+
+  if (find_result == SPS_FIND_VUI_PRESENT) {
+    /* Simple case: flip the existing bit. */
+    sodb[flag_bit_pos >> 3] |=
+        (uint8_t)(1u << (7 - (flag_bit_pos & 7)));
+    new_sodb = sodb;
+    new_sodb_size = sodb_size;
+    sodb = NULL; /* transferred ownership */
+  } else {
+    /* SPS_FIND_NO_VUI: splice in vui_parameters_present_flag=1 + 9-bit VUI
+     * body after the flag position. Everything after the flag bit (RBSP
+     * trailing bits, possibly RBSP stop bit) must shift right by 9 bits. */
+    size_t insert_pos = flag_bit_pos;    /* position of vui_parameters_present_flag */
+    size_t tail_start = insert_pos + 1;  /* first bit after the flag */
+    size_t tail_bits = sodb_size * 8 - tail_start;
+
+    /* New SODB: original bits up to and including insert_pos (which we'll
+     * set to 1), then 9 bits of VUI, then the remaining tail bits. */
+    size_t new_total_bits = insert_pos + 1 + 9 + tail_bits;
+    new_sodb_size = (new_total_bits + 7) / 8;
+    new_sodb = (uint8_t *)bmalloc(new_sodb_size);
+    if (!new_sodb) {
+      bfree(sodb);
+      return false;
+    }
+    memset(new_sodb, 0, new_sodb_size);
+
+    /* Copy bits [0, insert_pos) from old SODB. */
+    for (size_t i = 0; i < insert_pos; i++) {
+      uint8_t b = (sodb[i >> 3] >> (7 - (i & 7))) & 1u;
+      new_sodb[i >> 3] |= (uint8_t)(b << (7 - (i & 7)));
+    }
+
+    /* Write vui_parameters_present_flag = 1. */
+    size_t cursor = insert_pos;
+    bw_put_bits(new_sodb, &cursor, 1, 1);
+
+    /* Write minimal VUI body (9 bits): 7 "not present" flags + pic_struct=1 + restriction=0 */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* aspect_ratio_info_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* overscan_info_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* video_signal_type_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* chroma_loc_info_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* timing_info_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* nal_hrd_parameters_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* vcl_hrd_parameters_present_flag */
+    bw_put_bits(new_sodb, &cursor, 1, 1);  /* pic_struct_present_flag */
+    bw_put_bits(new_sodb, &cursor, 0, 1);  /* bitstream_restriction_flag */
+
+    /* Copy remaining tail bits (RBSP trailing bits from original SPS). */
+    for (size_t i = 0; i < tail_bits; i++) {
+      size_t src_bit = tail_start + i;
+      uint8_t b = (sodb[src_bit >> 3] >> (7 - (src_bit & 7))) & 1u;
+      new_sodb[cursor >> 3] |= (uint8_t)(b << (7 - (cursor & 7)));
+      cursor++;
+    }
+
+    bfree(sodb);
+    blog(LOG_INFO,
+         "[H.264 SPS patch] injected minimal VUI (9 bits) at bit %zu; "
+         "new SODB %zu bytes (was %zu)",
+         insert_pos, new_sodb_size, sodb_size);
+  }
 
   /* Re-encode SODB → RBSP with EPBs. */
-  size_t enc_capacity = sodb_size + sodb_size / 2 + 8;
+  size_t enc_capacity = new_sodb_size + new_sodb_size / 2 + 8;
   uint8_t *new_rbsp = (uint8_t *)bmalloc(enc_capacity);
   if (!new_rbsp) {
-    bfree(sodb);
+    bfree(new_sodb);
     return false;
   }
-  size_t new_rbsp_size = epb_encode(sodb, sodb_size, new_rbsp);
-  bfree(sodb);
+  size_t new_rbsp_size = epb_encode(new_sodb, new_sodb_size, new_rbsp);
+  bfree(new_sodb);
 
   /* Reassemble: everything before SPS start code (inclusive of start code)
    * + new SPS NAL bytes + everything from end of original SPS. */
