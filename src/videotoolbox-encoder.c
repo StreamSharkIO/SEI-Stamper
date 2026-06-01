@@ -298,15 +298,9 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
   enc->codec_context->time_base = (AVRational){voi->fps_den, voi->fps_num};
   enc->codec_context->framerate = (AVRational){voi->fps_num, voi->fps_den};
   enc->codec_context->bit_rate = enc->bitrate * 1000;
-  enc->codec_context->rc_max_rate = enc->bitrate * 1000;
-  enc->codec_context->rc_buffer_size = enc->bitrate * 1000;
   enc->codec_context->gop_size = enc->keyint;
   enc->codec_context->max_b_frames = enc->bframes;
   enc->codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-  encoder_log(LOG_INFO, enc, "Codec params: %dx%d, %d/%d fps, %d kbps, gop=%d, bframes=%d",
-              enc->width, enc->height, voi->fps_num, voi->fps_den,
-              enc->bitrate, enc->keyint, enc->bframes);
 
   AVDictionary *opts = NULL;
 
@@ -345,9 +339,8 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
     if (enc->profile && *enc->profile)
       av_dict_set(&opts, "profile", enc->profile, 0);
 
-    /* Force VUI with HRD parameters in the SPS so the SPS patcher can
-     * set pic_struct_present_flag=1. Without this, x264 emits an SPS
-     * with no VUI, and decoders won't parse pic_timing SEI timecodes. */
+    enc->codec_context->rc_max_rate = enc->bitrate * 1000;
+    enc->codec_context->rc_buffer_size = enc->bitrate * 1000;
     av_dict_set(&opts, "nal-hrd", "cbr", 0);
   }
 
