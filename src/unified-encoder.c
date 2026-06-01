@@ -12,6 +12,9 @@
 #include "amd-encoder.h"
 #include "nvenc-encoder.h"
 #include "qsv-encoder.h"
+#ifdef ENABLE_VIDEOTOOLBOX
+#include "videotoolbox-encoder.h"
+#endif
 #include <util/dstr.h>
 
 /* 日志宏 */
@@ -21,9 +24,11 @@
 
 /* 硬件类型名称 */
 static const char *hardware_type_names[] = {
-    "Intel QuickSync", // HARDWARE_TYPE_INTEL
-    "NVIDIA NVENC",    // HARDWARE_TYPE_NVIDIA
-    "AMD AMF",         // HARDWARE_TYPE_AMD
+    "Intel QuickSync",    // HARDWARE_TYPE_INTEL
+    "NVIDIA NVENC",       // HARDWARE_TYPE_NVIDIA
+    "AMD AMF",            // HARDWARE_TYPE_AMD
+    "Apple VideoToolbox", // HARDWARE_TYPE_VIDEOTOOLBOX
+    "x264 (Software)",    // HARDWARE_TYPE_SOFTWARE
 };
 
 /* 编码格式名称 */
@@ -83,8 +88,16 @@ static const char *get_encoder_name(hardware_type_t hw, codec_type_t codec) {
     default:
       return "h264_amf";
     }
+  case HARDWARE_TYPE_VIDEOTOOLBOX:
+    return "h264_videotoolbox";
+  case HARDWARE_TYPE_SOFTWARE:
+    return "libx264";
   default:
+#ifdef __APPLE__
+    return "h264_videotoolbox";
+#else
     return "h264_qsv";
+#endif
   }
 }
 
@@ -134,7 +147,11 @@ void *unified_encoder_create(obs_data_t *settings, obs_encoder_t *encoder) {
 
   // 验证范围
   if (enc->hardware_type >= HARDWARE_TYPE_COUNT) {
+#ifdef __APPLE__
+    enc->hardware_type = HARDWARE_TYPE_VIDEOTOOLBOX;
+#else
     enc->hardware_type = HARDWARE_TYPE_INTEL;
+#endif
   }
   if (enc->codec_type >= CODEC_TYPE_COUNT) {
     enc->codec_type = CODEC_TYPE_H264;
@@ -237,6 +254,42 @@ void *unified_encoder_create(obs_data_t *settings, obs_encoder_t *encoder) {
     break;
   }
 
+  case HARDWARE_TYPE_VIDEOTOOLBOX: {
+#ifdef ENABLE_VIDEOTOOLBOX
+    obs_data_set_int(settings, "codec_type", enc->codec_type);
+    void *result = vt_encoder_create_internal(settings, encoder, true);
+    if (result) {
+      enc->vt_encoder = result;
+      success = true;
+    } else {
+      blog(LOG_ERROR,
+           "[Unified Encoder] Failed to initialize VideoToolbox encoder");
+    }
+#else
+    blog(LOG_ERROR,
+         "[Unified Encoder] VideoToolbox not enabled in this build");
+#endif
+    break;
+  }
+
+  case HARDWARE_TYPE_SOFTWARE: {
+#ifdef ENABLE_VIDEOTOOLBOX
+    obs_data_set_int(settings, "codec_type", enc->codec_type);
+    void *result = vt_encoder_create_internal(settings, encoder, false);
+    if (result) {
+      enc->sw_encoder = result;
+      success = true;
+    } else {
+      blog(LOG_ERROR,
+           "[Unified Encoder] Failed to initialize x264 encoder");
+    }
+#else
+    blog(LOG_ERROR,
+         "[Unified Encoder] Software encoder not enabled in this build");
+#endif
+    break;
+  }
+
   default:
     blog(LOG_ERROR, "[Unified Encoder] Unknown hardware type: %d",
          enc->hardware_type);
@@ -288,6 +341,17 @@ void unified_encoder_destroy(void *data) {
     amd_encoder_destroy((amd_encoder_t *)enc->amd_encoder);
     // 不要bfree，因为amd_encoder_destroy已经释放了
     enc->amd_encoder = NULL;
+  }
+#endif
+
+#ifdef ENABLE_VIDEOTOOLBOX
+  if (enc->vt_encoder) {
+    vt_encoder_destroy((vt_encoder_t *)enc->vt_encoder);
+    enc->vt_encoder = NULL;
+  }
+  if (enc->sw_encoder) {
+    vt_encoder_destroy((vt_encoder_t *)enc->sw_encoder);
+    enc->sw_encoder = NULL;
   }
 #endif
 
@@ -343,6 +407,24 @@ bool unified_encoder_encode(void *data, struct encoder_frame *frame,
 #endif
     break;
 
+  case HARDWARE_TYPE_VIDEOTOOLBOX:
+#ifdef ENABLE_VIDEOTOOLBOX
+    if (enc->vt_encoder) {
+      return vt_encoder_encode_internal(enc->vt_encoder, frame, packet,
+                                        received_packet);
+    }
+#endif
+    break;
+
+  case HARDWARE_TYPE_SOFTWARE:
+#ifdef ENABLE_VIDEOTOOLBOX
+    if (enc->sw_encoder) {
+      return vt_encoder_encode_internal(enc->sw_encoder, frame, packet,
+                                        received_packet);
+    }
+#endif
+    break;
+
   default:
     break;
   }
@@ -354,7 +436,12 @@ bool unified_encoder_encode(void *data, struct encoder_frame *frame,
 /*===========================================================================
  /* 获取默认设置 - H.264专用 */
 void unified_encoder_get_defaults_h264(obs_data_t *settings) {
+#ifdef __APPLE__
+  obs_data_set_default_int(settings, "hardware_type",
+                           HARDWARE_TYPE_VIDEOTOOLBOX);
+#else
   obs_data_set_default_int(settings, "hardware_type", HARDWARE_TYPE_INTEL);
+#endif
   obs_data_set_default_int(settings, "codec_type_preset", CODEC_TYPE_H264);
   obs_data_set_default_int(settings, "bitrate", 2500);
   obs_data_set_default_int(settings, "keyint_sec", 2);
@@ -362,14 +449,23 @@ void unified_encoder_get_defaults_h264(obs_data_t *settings) {
   obs_data_set_default_string(settings, "profile", "high");
   obs_data_set_default_string(settings, "preset", "balanced");
   obs_data_set_default_bool(settings, "ntp_enabled", true);
+#ifdef __APPLE__
+  obs_data_set_default_string(settings, "ntp_server", "time.apple.com");
+#else
   obs_data_set_default_string(settings, "ntp_server", "pool.ntp.org");
+#endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms", 60000);
 }
 
 /* 获取默认设置 - H.265专用 */
 void unified_encoder_get_defaults_h265(obs_data_t *settings) {
+#ifdef __APPLE__
+  obs_data_set_default_int(settings, "hardware_type",
+                           HARDWARE_TYPE_VIDEOTOOLBOX);
+#else
   obs_data_set_default_int(settings, "hardware_type", HARDWARE_TYPE_INTEL);
+#endif
   obs_data_set_default_int(settings, "codec_type_preset", CODEC_TYPE_H265);
   obs_data_set_default_int(settings, "bitrate", 2500);
   obs_data_set_default_int(settings, "keyint_sec", 2);
@@ -377,14 +473,23 @@ void unified_encoder_get_defaults_h265(obs_data_t *settings) {
   obs_data_set_default_string(settings, "profile", "high");
   obs_data_set_default_string(settings, "preset", "balanced");
   obs_data_set_default_bool(settings, "ntp_enabled", true);
+#ifdef __APPLE__
+  obs_data_set_default_string(settings, "ntp_server", "time.apple.com");
+#else
   obs_data_set_default_string(settings, "ntp_server", "pool.ntp.org");
+#endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms", 60000);
 }
 
 /* 获取默认设置 - AV1专用 */
 void unified_encoder_get_defaults_av1(obs_data_t *settings) {
+#ifdef __APPLE__
+  obs_data_set_default_int(settings, "hardware_type",
+                           HARDWARE_TYPE_VIDEOTOOLBOX);
+#else
   obs_data_set_default_int(settings, "hardware_type", HARDWARE_TYPE_INTEL);
+#endif
   obs_data_set_default_int(settings, "codec_type_preset", CODEC_TYPE_AV1);
   obs_data_set_default_int(settings, "bitrate", 2500);
   obs_data_set_default_int(settings, "keyint_sec", 2);
@@ -392,7 +497,11 @@ void unified_encoder_get_defaults_av1(obs_data_t *settings) {
   obs_data_set_default_string(settings, "profile", "high");
   obs_data_set_default_string(settings, "preset", "balanced");
   obs_data_set_default_bool(settings, "ntp_enabled", true);
+#ifdef __APPLE__
+  obs_data_set_default_string(settings, "ntp_server", "time.apple.com");
+#else
   obs_data_set_default_string(settings, "ntp_server", "pool.ntp.org");
+#endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms", 60000);
 }
@@ -402,8 +511,13 @@ void unified_encoder_get_defaults_av1(obs_data_t *settings) {
  *===========================================================================*/
 
 void unified_encoder_get_defaults(obs_data_t *settings) {
-  // 默认硬件类型：Intel QuickSync
+  // 默认硬件类型
+#ifdef __APPLE__
+  obs_data_set_default_int(settings, "hardware_type",
+                           HARDWARE_TYPE_VIDEOTOOLBOX);
+#else
   obs_data_set_default_int(settings, "hardware_type", HARDWARE_TYPE_INTEL);
+#endif
 
   // 默认编码格式：H.264
   obs_data_set_default_int(settings, "codec_type", CODEC_TYPE_H264);
@@ -417,7 +531,11 @@ void unified_encoder_get_defaults(obs_data_t *settings) {
 
   // NTP同步默认值
   obs_data_set_default_bool(settings, "ntp_enabled", true);
+#ifdef __APPLE__
+  obs_data_set_default_string(settings, "ntp_server", "time.apple.com");
+#else
   obs_data_set_default_string(settings, "ntp_server", "pool.ntp.org");
+#endif
   obs_data_set_default_int(settings, "ntp_port", 123);
   obs_data_set_default_int(settings, "ntp_sync_interval_ms",
                            60000); // 60秒
@@ -437,9 +555,16 @@ obs_properties_t *unified_encoder_properties(void *unused) {
       obs_properties_add_list(props, "hardware_type", "Hardware Encoder",
                               OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 
+#ifdef __APPLE__
+  obs_property_list_add_int(hw_list, "Apple VideoToolbox",
+                            HARDWARE_TYPE_VIDEOTOOLBOX);
+  obs_property_list_add_int(hw_list, "x264 (Software)",
+                            HARDWARE_TYPE_SOFTWARE);
+#else
   obs_property_list_add_int(hw_list, "Intel QuickSync", HARDWARE_TYPE_INTEL);
   obs_property_list_add_int(hw_list, "NVIDIA NVENC", HARDWARE_TYPE_NVIDIA);
   obs_property_list_add_int(hw_list, "AMD AMF", HARDWARE_TYPE_AMD);
+#endif
 
   // Codec Format 已经通过注册不同的encoder固定，不再需要UI选择
 
@@ -541,6 +666,24 @@ void unified_encoder_get_video_info(void *data, struct video_scale_info *info) {
 #endif
     break;
 
+  case HARDWARE_TYPE_VIDEOTOOLBOX:
+#ifdef ENABLE_VIDEOTOOLBOX
+    if (enc->vt_encoder) {
+      vt_encoder_get_video_info_internal(enc->vt_encoder, info);
+      return;
+    }
+#endif
+    break;
+
+  case HARDWARE_TYPE_SOFTWARE:
+#ifdef ENABLE_VIDEOTOOLBOX
+    if (enc->sw_encoder) {
+      vt_encoder_get_video_info_internal(enc->sw_encoder, info);
+      return;
+    }
+#endif
+    break;
+
   default:
     break;
   }
@@ -585,6 +728,24 @@ bool unified_encoder_get_extra_data(void *data, uint8_t **extra_data,
     if (enc->amd_encoder) {
       return amd_encoder_get_extra_data_internal(enc->amd_encoder, extra_data,
                                                  size);
+    }
+#endif
+    break;
+
+  case HARDWARE_TYPE_VIDEOTOOLBOX:
+#ifdef ENABLE_VIDEOTOOLBOX
+    if (enc->vt_encoder) {
+      return vt_encoder_get_extra_data_internal(enc->vt_encoder, extra_data,
+                                                size);
+    }
+#endif
+    break;
+
+  case HARDWARE_TYPE_SOFTWARE:
+#ifdef ENABLE_VIDEOTOOLBOX
+    if (enc->sw_encoder) {
+      return vt_encoder_get_extra_data_internal(enc->sw_encoder, extra_data,
+                                                size);
     }
 #endif
     break;

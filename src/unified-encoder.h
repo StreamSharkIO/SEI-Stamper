@@ -21,7 +21,9 @@ extern "C" {
 typedef enum {
   HARDWARE_TYPE_INTEL = 0,  /* Intel QuickSync */
   HARDWARE_TYPE_NVIDIA = 1, /* NVIDIA NVENC */
-  HARDWARE_TYPE_AMD = 2,    /* AMD AMF */
+  HARDWARE_TYPE_AMD = 2,          /* AMD AMF */
+  HARDWARE_TYPE_VIDEOTOOLBOX = 3, /* Apple VideoToolbox */
+  HARDWARE_TYPE_SOFTWARE = 4,     /* x264 software */
   HARDWARE_TYPE_COUNT
 } hardware_type_t;
 
@@ -45,6 +47,8 @@ typedef struct unified_encoder {
   void *qsv_encoder;   /* qsv_encoder_t* */
   void *nvenc_encoder; /* nvenc_encoder_t* */
   void *amd_encoder;   /* amd_encoder_t* */
+  void *vt_encoder;    /* vt_encoder_t* (VideoToolbox) */
+  void *sw_encoder;    /* vt_encoder_t* (x264 software) */
 
 } unified_encoder_t;
 
