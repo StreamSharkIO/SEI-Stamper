@@ -1,13 +1,10 @@
 #include "qsv-encoder.h"
-#include "sei-stamper-encoder.h" /* For NAL unit helpers if we move them, or redefine */
 #include <util/dstr.h>
 #include <util/platform.h>
 
-// Re-implementing simplified SEI helpers valid for this module to avoid linking
-// issues or we can expose them from sei-stamper-encoder.h if we modify it. For
-// safety, providing local versions.
-
 #ifdef ENABLE_VPL
+
+#include "sei-stamper-encoder.h"
 
 #include <stdio.h>
 #include <stdlib.h>

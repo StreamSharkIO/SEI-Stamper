@@ -55,9 +55,11 @@ if(APPLE)
         pkg_check_modules(FFMPEG QUIET libavcodec libavformat libavutil)
     endif()
 
+    # OBS headers from source tree
+    set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
+
     if(NOT FFMPEG_FOUND)
         # Try OBS source tree deps
-        set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
         file(GLOB OBS_DEPS_DIRS
              "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-universal")
         if(NOT OBS_DEPS_DIRS)
@@ -78,28 +80,29 @@ if(APPLE)
         endif()
     endif()
 
+    # SIMDE (SSE intrinsics emulation for ARM, required by OBS headers)
+    find_path(SIMDE_INCLUDE_DIR simde/x86/sse2.h
+        PATHS /opt/homebrew/opt/simde/include /usr/local/include)
+
     target_include_directories(sei-stamper PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${LIBOBS_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/obs-studio-master/build/config
         ${FFMPEG_INCLUDE_DIRS}
+        ${SIMDE_INCLUDE_DIR}
     )
 
     # Link OBS
     if(NOT libobs_FOUND)
-        # Find libobs dylib
-        find_library(LIBOBS_LIBRARY obs
-            PATHS "${OBS_DIR}/lib" "${OBS_DIR}/bin"
+        find_library(LIBOBS_LIBRARY libobs
+            PATHS "/Applications/OBS.app/Contents/Frameworks"
+                  "${OBS_DIR}/lib" "${OBS_DIR}/bin"
                   "${CMAKE_SOURCE_DIR}/obs-studio-master/build/libobs")
         if(LIBOBS_LIBRARY)
+            message(STATUS "Found libobs: ${LIBOBS_LIBRARY}")
             target_link_libraries(sei-stamper ${LIBOBS_LIBRARY})
         else()
-            add_library(OBS::libobs SHARED IMPORTED)
-            set_target_properties(OBS::libobs PROPERTIES
-                IMPORTED_LOCATION "${OBS_DIR}/lib/libobs.dylib"
-                INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR}"
-            )
-            target_link_libraries(sei-stamper OBS::libobs)
+            message(FATAL_ERROR "Could not find libobs. Install OBS Studio or set OBS_DIR.")
         endif()
     else()
         target_link_libraries(sei-stamper OBS::libobs)
