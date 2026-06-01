@@ -298,9 +298,15 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
   enc->codec_context->time_base = (AVRational){voi->fps_den, voi->fps_num};
   enc->codec_context->framerate = (AVRational){voi->fps_num, voi->fps_den};
   enc->codec_context->bit_rate = enc->bitrate * 1000;
+  enc->codec_context->rc_max_rate = enc->bitrate * 1000;
+  enc->codec_context->rc_buffer_size = enc->bitrate * 1000;
   enc->codec_context->gop_size = enc->keyint;
   enc->codec_context->max_b_frames = enc->bframes;
   enc->codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+  encoder_log(LOG_INFO, enc, "Codec params: %dx%d, %d/%d fps, %d kbps, gop=%d, bframes=%d",
+              enc->width, enc->height, voi->fps_num, voi->fps_den,
+              enc->bitrate, enc->keyint, enc->bframes);
 
   AVDictionary *opts = NULL;
 
@@ -456,7 +462,9 @@ bool vt_encoder_encode_internal(void *data, struct encoder_frame *frame,
         .pixfmt = (enc->codec_context->pix_fmt == AV_PIX_FMT_NV12)
                       ? TC_PIX_NV12 : TC_PIX_YUV420P,
     };
-    timecode_render_draw(&enc->current_ntp_time, &tc_frame,
+    timecode_render_draw(&enc->current_ntp_time,
+                         (uint32_t)enc->fps_num, (uint32_t)enc->fps_den,
+                         &tc_frame,
                          (timecode_position_t)enc->timecode_position);
   }
 
