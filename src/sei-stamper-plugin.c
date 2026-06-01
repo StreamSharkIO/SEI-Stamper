@@ -30,29 +30,31 @@ MODULE_EXPORT const char *obs_module_name(void) { return "SEI Stamper"; }
 
 // 前向声明 - 统一编码器（三个独立的codec版本）
 extern struct obs_encoder_info unified_encoder_info_h264;
+#ifndef __APPLE__
 extern struct obs_encoder_info unified_encoder_info_h265;
 extern struct obs_encoder_info unified_encoder_info_av1;
 
 // 前向声明 - 源
 extern struct obs_source_info sei_receiver_source_info;
+#endif
 
 // 模块加载
 bool obs_module_load(void) {
   blog(LOG_INFO, "SEI Stamper Plugin loaded");
 
-  /* 注册三个独立的SEI Stamper编码器（每种codec一个） */
   blog(LOG_INFO, "Registering SEI Stamper H.264 encoder");
   obs_register_encoder(&unified_encoder_info_h264);
 
+#ifndef __APPLE__
   blog(LOG_INFO, "Registering SEI Stamper H.265 encoder");
   obs_register_encoder(&unified_encoder_info_h265);
 
   blog(LOG_INFO, "Registering SEI Stamper AV1 encoder");
   obs_register_encoder(&unified_encoder_info_av1);
 
-  /* 注册SEI接收器源 */
   blog(LOG_INFO, "Registering SEI Receiver source");
   obs_register_source(&sei_receiver_source_info);
+#endif
 
   return true;
 }
