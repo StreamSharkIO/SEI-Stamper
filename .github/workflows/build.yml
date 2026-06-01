@@ -107,3 +107,109 @@ jobs:
         with:
           name: sei-stamper-macos
           path: build/package/
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6
+        run: |
+          pip install aqtinstall==3.3.0
+          python -m aqt install-qt windows desktop ${{ env.QT_VERSION }} win64_msvc2022_64 --outputdir ${{ github.workspace }}/Qt
+          echo "${{ github.workspace }}/Qt/${{ env.QT_VERSION }}/msvc2022_64/lib/cmake" >> $env:GITHUB_PATH
+          echo "CMAKE_PREFIX_PATH=${{ github.workspace }}/Qt/${{ env.QT_VERSION }}/msvc2022_64" >> $env:GITHUB_ENV
+
+      - name: Download OBS source
+        shell: bash
+        run: |
+          curl -sL "https://github.com/obsproject/obs-studio/archive/refs/tags/${{ env.OBS_VERSION }}.tar.gz" -o obs-source.tar.gz
+          tar xzf obs-source.tar.gz
+
+      - name: Generate obsconfig.h
+        shell: bash
+        run: |
+          cat > obs-studio-${{ env.OBS_VERSION }}/libobs/obsconfig.h << 'EOF'
+          #pragma once
+          #define OBS_DATA_PATH ""
+          #define OBS_PLUGIN_PATH ""
+          #define OBS_PLUGIN_DESTINATION ""
+          #define OBS_RELEASE_CANDIDATE 0
+          #define OBS_BETA 0
+          EOF
+
+      - name: Download OBS Windows release
+        shell: bash
+        run: |
+          curl -sL "https://github.com/obsproject/obs-studio/releases/download/${{ env.OBS_VERSION }}/obs-studio-${{ env.OBS_VERSION }}-windows-x64.zip" -o obs-win.zip
+          unzip -q obs-win.zip -d obs-win
+
+      - name: Download OBS deps
+        shell: bash
+        run: |
+          curl -sL "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/windows-deps-${{ env.OBS_DEPS_VERSION }}-x64.zip" -o obs-deps.zip
+          mkdir -p obs-studio-${{ env.OBS_VERSION }}/.deps
+          unzip -q obs-deps.zip -d obs-studio-${{ env.OBS_VERSION }}/.deps/obs-deps-${{ env.OBS_DEPS_VERSION }}-x64
+
+      - name: Generate import libraries from DLLs
+        shell: pwsh
+        run: |
+          $obsDir = "${{ github.workspace }}\obs-win\obs-studio-${{ env.OBS_VERSION }}-windows-x64"
+          $obsDll = Get-ChildItem -Path "${{ github.workspace }}\obs-win" -Recurse -Filter "obs.dll" | Select-Object -First 1
+          $obsBin = $obsDll.DirectoryName
+          $libDir = "$obsDir\lib"
+          New-Item -ItemType Directory -Force -Path $libDir
+
+          Write-Host "Found OBS binaries at: $obsBin"
+
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $libExe = (Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -Last 1).FullName
+          $dumpbin = (Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -Last 1).FullName
+
+          function Generate-Lib($dllName, $libName) {
+            $dllPath = "$obsBin\$dllName"
+            $baseName = $dllName -replace '\.dll$',''
+            Write-Host "Processing $dllPath..."
+            $output = & $dumpbin /exports $dllPath
+            $names = $output | ForEach-Object {
+              if ($_ -match '\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') {
+                $Matches[1]
+              }
+            } | Where-Object { $_ }
+            Write-Host "Found $($names.Count) exports"
+            $defContent = "LIBRARY $baseName`r`nEXPORTS`r`n"
+            foreach ($name in $names) {
+              $defContent += "  $name`r`n"
+            }
+            $defPath = "$libDir\$baseName.def"
+            [System.IO.File]::WriteAllText($defPath, $defContent)
+            & $libExe /def:$defPath /out:"$libDir\$libName" /machine:x64
+          }
+
+          Generate-Lib "obs.dll" "obs.lib"
+          Generate-Lib "obs-frontend-api.dll" "obs-frontend-api.lib"
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build \
+            -DOBS_SOURCE_DIR="${{ github.workspace }}/obs-studio-${{ env.OBS_VERSION }}" \
+            -DOBS_DIR="${{ github.workspace }}/obs-win/obs-studio-${{ env.OBS_VERSION }}-windows-x64" \
+            -DPLUGIN_VERSION="${GITHUB_REF_NAME#v}"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p build/package/obs-plugins/64bit
+          mkdir -p build/package/data/obs-plugins/sei-stamper
+          cp build/plugin/Release/sei-stamper.dll build/package/obs-plugins/64bit/
+          cp -r data/locale build/package/data/obs-plugins/sei-stamper/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sei-stamper-windows
+          path: build/package/
