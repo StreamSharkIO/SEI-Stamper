@@ -177,6 +177,7 @@ elseif(WIN32)
         "${OBS_SOURCE_DIR}/build/deps/w32-pthreads/Release"
         "${OBS_SOURCE_DIR}/build/deps/w32-pthreads/Debug"
         "${LATEST_OBS_DEPS_DIR}/lib"
+        "${OBS_DIR}/lib"
     )
 
     if(NOT FFMPEG_FOUND)

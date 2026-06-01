@@ -188,6 +188,7 @@ jobs:
 
           Generate-Lib "obs.dll" "obs.lib"
           Generate-Lib "obs-frontend-api.dll" "obs-frontend-api.lib"
+          Generate-Lib "w32-pthreads.dll" "w32-pthreads.lib"
 
       - name: Configure
         shell: bash
