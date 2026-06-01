@@ -1,199 +1,238 @@
 cmake_minimum_required(VERSION 3.20)
 project(sei-stamper VERSION 1.2.2)
 
-# 设置C/C++标准
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-# 查找OBS Studio库
-# 需要设置OBS的安装路径
+# --- OBS Studio ---
 if(NOT DEFINED OBS_DIR)
-    set(OBS_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/build/rundir/Release" CACHE PATH "OBS installation directory")
+    set(OBS_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/build/rundir/Release"
+        CACHE PATH "OBS installation directory")
 endif()
-
-# 添加OBS的CMake模块路径
 list(APPEND CMAKE_MODULE_PATH "${OBS_DIR}/../cmake")
 list(APPEND CMAKE_PREFIX_PATH "${OBS_DIR}")
 
-# 查找libobs
 find_package(libobs QUIET)
 if(NOT libobs_FOUND)
-    # 手动设置libobs路径(如果find_package失败)
-    set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
-    set(LIBOBS_LIB_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/build/libobs/Release")
-    set(LIBOBS_BIN_DIR "${OBS_DIR}/bin/64bit")
-    
-    add_library(OBS::libobs SHARED IMPORTED)
-    set_target_properties(OBS::libobs PROPERTIES
-        IMPORTED_LOCATION "${LIBOBS_BIN_DIR}/obs.dll"
-        IMPORTED_IMPLIB "${LIBOBS_LIB_DIR}/obs.lib"
-        INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR}"
-    )
-    
-    message(STATUS "Using manual libobs configuration")
-    message(STATUS "  Include: ${LIBOBS_INCLUDE_DIR}")
-    message(STATUS "  Lib: ${LIBOBS_LIB_DIR}/obs.lib")
-    message(STATUS "  DLL: ${LIBOBS_BIN_DIR}/obs.dll")
+    # Manual libobs setup (paths differ per platform, handled below)
 endif()
 
-# 源文件列表
+# --- Source files (shared) ---
 set(PLUGIN_SOURCES
     src/sei-stamper-plugin.c
     src/ntp-client.c
     src/sei-handler.c
     src/h264-sps.c
-    src/sei-stamper-encoder.c
-    src/unified-encoder.c      # Unified Encoder Wrapper
-    src/qsv-encoder.c          # Intel VPL Encoder
-    src/nvenc-encoder.c        # NVIDIA NVENC Encoder
-    src/amd-encoder.c          # AMD AMF Encoder
-    src/sei-receiver-source.c  # 重新启用
+    src/unified-encoder.c
 )
 
-# 创建插件模块
-add_library(sei-stamper MODULE
-    ${PLUGIN_SOURCES}
-)
-
-# 查找pthread库（Windows）
-find_library(PTHREAD_LIBRARY NAMES w32-pthreads
-    PATHS
-    "${CMAKE_SOURCE_DIR}/obs-studio-master/build/deps/w32-pthreads/Release"
-    "${CMAKE_SOURCE_DIR}/obs-studio-master/build/deps/w32-pthreads/Debug"
-)
-
-if(PTHREAD_LIBRARY)
-    message(STATUS "Found pthread library: ${PTHREAD_LIBRARY}")
-else()
-    message(WARNING "pthread library not found")
+if(APPLE)
+    # macOS: add VideoToolbox encoder, exclude Windows-only files
+    list(APPEND PLUGIN_SOURCES src/videotoolbox-encoder.c)
+    # Stubs for disabled encoders (their .c files have #ifdef guards that
+    # produce empty translation units, but we still compile them for the
+    # extern struct obs_encoder_info symbols)
+    list(APPEND PLUGIN_SOURCES src/nvenc-encoder.c src/qsv-encoder.c
+         src/amd-encoder.c)
+elseif(WIN32)
+    # Windows: all original sources
+    list(APPEND PLUGIN_SOURCES
+        src/sei-stamper-encoder.c
+        src/qsv-encoder.c
+        src/nvenc-encoder.c
+        src/amd-encoder.c
+        src/sei-receiver-source.c
+    )
 endif()
 
-# 查找FFmpeg库
-find_package(PkgConfig)
-if(PKG_CONFIG_FOUND)
-    pkg_check_modules(FFMPEG QUIET libavcodec libavformat libavutil libswscale)
+add_library(sei-stamper MODULE ${PLUGIN_SOURCES})
+
+# --- Platform-specific configuration ---
+if(APPLE)
+    # Find FFmpeg via pkg-config or OBS deps
+    find_package(PkgConfig)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(FFMPEG QUIET libavcodec libavformat libavutil)
+    endif()
+
+    if(NOT FFMPEG_FOUND)
+        # Try OBS source tree deps
+        set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
+        file(GLOB OBS_DEPS_DIRS
+             "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-universal")
+        if(NOT OBS_DEPS_DIRS)
+            file(GLOB OBS_DEPS_DIRS
+                 "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-arm64")
+        endif()
+        if(NOT OBS_DEPS_DIRS)
+            file(GLOB OBS_DEPS_DIRS
+                 "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-*-x86_64")
+        endif()
+        list(SORT OBS_DEPS_DIRS)
+        list(REVERSE OBS_DEPS_DIRS)
+        if(OBS_DEPS_DIRS)
+            list(GET OBS_DEPS_DIRS 0 LATEST_OBS_DEPS_DIR)
+            message(STATUS "Found OBS deps: ${LATEST_OBS_DEPS_DIR}")
+            set(FFMPEG_INCLUDE_DIRS "${LATEST_OBS_DEPS_DIR}/include")
+            set(FFMPEG_LIBRARY_DIRS "${LATEST_OBS_DEPS_DIR}/lib")
+        endif()
+    endif()
+
+    target_include_directories(sei-stamper PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${LIBOBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/obs-studio-master/build/config
+        ${FFMPEG_INCLUDE_DIRS}
+    )
+
+    # Link OBS
+    if(NOT libobs_FOUND)
+        # Find libobs dylib
+        find_library(LIBOBS_LIBRARY obs
+            PATHS "${OBS_DIR}/lib" "${OBS_DIR}/bin"
+                  "${CMAKE_SOURCE_DIR}/obs-studio-master/build/libobs")
+        if(LIBOBS_LIBRARY)
+            target_link_libraries(sei-stamper ${LIBOBS_LIBRARY})
+        else()
+            add_library(OBS::libobs SHARED IMPORTED)
+            set_target_properties(OBS::libobs PROPERTIES
+                IMPORTED_LOCATION "${OBS_DIR}/lib/libobs.dylib"
+                INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR}"
+            )
+            target_link_libraries(sei-stamper OBS::libobs)
+        endif()
+    else()
+        target_link_libraries(sei-stamper OBS::libobs)
+    endif()
+
+    # Link FFmpeg
+    if(FFMPEG_LIBRARY_DIRS)
+        target_link_directories(sei-stamper PRIVATE ${FFMPEG_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(sei-stamper avcodec avformat avutil)
+
+    # Apple frameworks
+    find_library(VIDEOTOOLBOX_FRAMEWORK VideoToolbox)
+    find_library(COREMEDIA_FRAMEWORK CoreMedia)
+    find_library(COREVIDEO_FRAMEWORK CoreVideo)
+    target_link_libraries(sei-stamper
+        ${VIDEOTOOLBOX_FRAMEWORK}
+        ${COREMEDIA_FRAMEWORK}
+        ${COREVIDEO_FRAMEWORK}
+    )
+
+    target_compile_definitions(sei-stamper PRIVATE ENABLE_VIDEOTOOLBOX)
+
+elseif(WIN32)
+    # === Windows: original configuration (unchanged) ===
+    if(NOT libobs_FOUND)
+        set(LIBOBS_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/libobs")
+        set(LIBOBS_LIB_DIR
+            "${CMAKE_SOURCE_DIR}/obs-studio-master/build/libobs/Release")
+        set(LIBOBS_BIN_DIR "${OBS_DIR}/bin/64bit")
+        add_library(OBS::libobs SHARED IMPORTED)
+        set_target_properties(OBS::libobs PROPERTIES
+            IMPORTED_LOCATION "${LIBOBS_BIN_DIR}/obs.dll"
+            IMPORTED_IMPLIB "${LIBOBS_LIB_DIR}/obs.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR}"
+        )
+    endif()
+
+    find_library(PTHREAD_LIBRARY NAMES w32-pthreads
+        PATHS
+        "${CMAKE_SOURCE_DIR}/obs-studio-master/build/deps/w32-pthreads/Release"
+        "${CMAKE_SOURCE_DIR}/obs-studio-master/build/deps/w32-pthreads/Debug"
+    )
+
+    find_package(PkgConfig)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(FFMPEG QUIET libavcodec libavformat libavutil libswscale)
+    endif()
+
+    file(GLOB OBS_DEPS_DIRS
+         "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-20??-??-??-x64")
+    list(SORT OBS_DEPS_DIRS)
+    list(REVERSE OBS_DEPS_DIRS)
+    if(OBS_DEPS_DIRS)
+        list(GET OBS_DEPS_DIRS 0 LATEST_OBS_DEPS_DIR)
+    else()
+        set(LATEST_OBS_DEPS_DIR
+            "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-2025-08-23-x64")
+    endif()
+
+    if(NOT FFMPEG_FOUND)
+        set(FFMPEG_INCLUDE_DIRS "${LATEST_OBS_DEPS_DIR}/include")
+        set(FFMPEG_LIBRARY_DIRS "${LATEST_OBS_DEPS_DIR}/bin")
+    endif()
+
+    set(X264_INCLUDE_DIR "${LATEST_OBS_DEPS_DIR}/include")
+    set(X264_LIBRARY "${LATEST_OBS_DEPS_DIR}/lib/libx264.lib")
+
+    target_include_directories(sei-stamper PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${LIBOBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/obs-studio-master/build/config
+        ${CMAKE_SOURCE_DIR}/obs-studio-master/deps/w32-pthreads
+        ${FFMPEG_INCLUDE_DIRS}
+    )
+
+    # SRT
+    find_library(SRT_LIBRARY NAMES srt libsrt
+        PATHS
+        "${CMAKE_SOURCE_DIR}/srt/_build/Release"
+        "${OBS_DIR}/bin/64bit"
+    )
+    if(SRT_LIBRARY)
+        set(SRT_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/srt/srtcore")
+        target_include_directories(sei-stamper PRIVATE ${SRT_INCLUDE_DIRS})
+    endif()
+
+    target_link_libraries(sei-stamper
+        OBS::libobs
+        ws2_32
+        ${PTHREAD_LIBRARY}
+    )
+
+    set(FFMPEG_LIB_DIR "${LATEST_OBS_DEPS_DIR}/lib")
+    target_link_libraries(sei-stamper
+        "${FFMPEG_LIB_DIR}/avcodec.lib"
+        "${FFMPEG_LIB_DIR}/avformat.lib"
+        "${FFMPEG_LIB_DIR}/avutil.lib"
+        "${FFMPEG_LIB_DIR}/swscale.lib"
+    )
+
+    if(EXISTS "${X264_LIBRARY}")
+        target_link_libraries(sei-stamper "${X264_LIBRARY}")
+    endif()
+
+    # VPL
+    set(VPL_LIBRARY "${LATEST_OBS_DEPS_DIR}/lib/vpl.lib")
+    if(EXISTS "${VPL_LIBRARY}")
+        target_include_directories(sei-stamper
+            PRIVATE "${LATEST_OBS_DEPS_DIR}/include")
+        target_link_libraries(sei-stamper "${VPL_LIBRARY}")
+        add_definitions(-DENABLE_VPL)
+    endif()
+
+    add_definitions(-DENABLE_NVENC)
+    add_definitions(-DENABLE_AMD)
+
+    if(SRT_LIBRARY)
+        target_link_libraries(sei-stamper ${SRT_LIBRARY})
+    endif()
 endif()
 
-# 动态查找最新的 obs-deps 目录
-file(GLOB OBS_DEPS_DIRS "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-20??-??-??-x64")
-list(SORT OBS_DEPS_DIRS)
-list(REVERSE OBS_DEPS_DIRS)
-if(OBS_DEPS_DIRS)
-    list(GET OBS_DEPS_DIRS 0 LATEST_OBS_DEPS_DIR)
-    message(STATUS "Found latest OBS deps: ${LATEST_OBS_DEPS_DIR}")
-else()
-    message(WARNING "Could not find any OBS deps directory in ${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/")
-    set(LATEST_OBS_DEPS_DIR "${CMAKE_SOURCE_DIR}/obs-studio-master/.deps/obs-deps-2025-08-23-x64")
-endif()
-
-# 如果pkg-config找不到，手动设置FFmpeg路径
-if(NOT FFMPEG_FOUND)
-    # OBS的FFmpeg依赖位于.deps目录
-    set(FFMPEG_INCLUDE_DIRS "${LATEST_OBS_DEPS_DIR}/include")
-    set(FFMPEG_LIBRARY_DIRS "${LATEST_OBS_DEPS_DIR}/bin")
-    set(FFMPEG_LIBRARIES avcodec avformat avutil swscale)
-    message(STATUS "Using OBS deps FFmpeg configuration")
-    message(STATUS "  FFmpeg include: ${FFMPEG_INCLUDE_DIRS}")
-endif()
-
-# 查找x264库（用于编码器）
-set(X264_INCLUDE_DIR "${LATEST_OBS_DEPS_DIR}/include")
-set(X264_LIBRARY "${LATEST_OBS_DEPS_DIR}/lib/libx264.lib")
-
-if(EXISTS "${X264_LIBRARY}")
-    message(STATUS "Found x264 library: ${X264_LIBRARY}")
-else()
-    message(WARNING "x264 library not found, encoder may not work")
-endif()
-
-# 包含目录（在所有变量设置后）
-target_include_directories(sei-stamper PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${LIBOBS_INCLUDE_DIR}
-    ${CMAKE_SOURCE_DIR}/obs-studio-master/build/config
-    ${CMAKE_SOURCE_DIR}/obs-studio-master/deps/w32-pthreads  # pthread头文件
-    ${FFMPEG_INCLUDE_DIRS}
-)
-
-# 查找SRT库
-find_library(SRT_LIBRARY NAMES srt libsrt
-    PATHS 
-    "${CMAKE_SOURCE_DIR}/srt/_build/Release"
-    "${CMAKE_SOURCE_DIR}/obs-studio-master/build/rundir/Release/bin/64bit"
-    "${CMAKE_SOURCE_DIR}/obs-studio-master/plugins/obs-outputs"
-)
-
-if(SRT_LIBRARY)
-    message(STATUS "Found SRT library: ${SRT_LIBRARY}")
-    set(SRT_LIBRARIES ${SRT_LIBRARY})
-    # SRT头文件
-    set(SRT_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/srt/srtcore")
-    # 添加SRT头文件路径
-    target_include_directories(sei-stamper PRIVATE ${SRT_INCLUDE_DIRS})
-else()
-    message(WARNING "SRT library not found, receiver functionality will be limited")
-    set(SRT_LIBRARIES "")  # 设为空而不是NOTFOUND
-    set(SRT_INCLUDE_DIRS "")
-endif()
-
-# 链接库
-target_link_libraries(sei-stamper
-    OBS::libobs
-    ws2_32  # Windows Socket库(NTP客户端需要)
-    ${PTHREAD_LIBRARY}  # pthread库
-)
-
-# 添加FFmpeg库（使用完整路径）
-set(FFMPEG_LIB_DIR "${LATEST_OBS_DEPS_DIR}/lib")
-target_link_libraries(sei-stamper
-    "${FFMPEG_LIB_DIR}/avcodec.lib"
-    "${FFMPEG_LIB_DIR}/avformat.lib"
-    "${FFMPEG_LIB_DIR}/avutil.lib"
-    "${FFMPEG_LIB_DIR}/swscale.lib"
-)
-
-# 添加x264库
-target_link_libraries(sei-stamper
-    "${X264_LIBRARY}"
-)
-
-# 添加Intel VPL库
-set(VPL_INCLUDE_DIR "${LATEST_OBS_DEPS_DIR}/include")
-set(VPL_LIBRARY "${LATEST_OBS_DEPS_DIR}/lib/vpl.lib")
-
-if(EXISTS "${VPL_LIBRARY}")
-    message(STATUS "Found VPL library: ${VPL_LIBRARY}")
-    target_include_directories(sei-stamper PRIVATE "${VPL_INCLUDE_DIR}")
-    target_link_libraries(sei-stamper "${VPL_LIBRARY}")
-    add_definitions(-DENABLE_VPL)
-else()
-    message(WARNING "VPL library not found, Intel QuickSync (Native) will be disabled")
-endif()
-
-# 启用 NVENC 和 AMD 编码器 (通过 FFmpeg，无需额外库)
-add_definitions(-DENABLE_NVENC)
-add_definitions(-DENABLE_AMD)
-message(STATUS "Enabled NVENC and AMD encoders (via FFmpeg)")
-
-
-# 如果找到SRT库，才链接
-if(SRT_LIBRARY)
-    target_link_libraries(sei-stamper ${SRT_LIBRARIES})
-endif()
-
-# 设置输出目录
+# --- Output ---
 set_target_properties(sei-stamper PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugin"
 )
 
-# 安装规则
 install(TARGETS sei-stamper
     LIBRARY DESTINATION obs-plugins/64bit
     RUNTIME DESTINATION obs-plugins/64bit
 )
 
-# 安装数据文件(本地化等)
 install(DIRECTORY data/
     DESTINATION data/obs-plugins/sei-stamper
 )
@@ -202,5 +241,6 @@ message(STATUS "=================================================")
 message(STATUS "SEI Stamper Plugin Configuration")
 message(STATUS "=================================================")
 message(STATUS "OBS Directory: ${OBS_DIR}")
+message(STATUS "Platform: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "=================================================")
