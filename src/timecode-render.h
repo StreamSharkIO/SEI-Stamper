@@ -32,6 +32,7 @@ typedef struct timecode_frame {
 } timecode_frame_t;
 
 void timecode_render_draw(const ntp_timestamp_t *ntp,
+                          uint32_t fps_num, uint32_t fps_den,
                           timecode_frame_t *frame,
                           timecode_position_t position);
 

@@ -74,10 +74,18 @@ static const uint8_t font_data[][GLYPH_H] = {
 #define NTP_EPOCH_DELTA 2208988800ULL
 #define PAD 4
 
-static void ntp_to_iso8601(const ntp_timestamp_t *ntp, char *buf, size_t buf_size) {
+static void ntp_to_iso8601_frames(const ntp_timestamp_t *ntp,
+                                  uint32_t fps_num, uint32_t fps_den,
+                                  char *buf, size_t buf_size) {
   uint64_t unix_sec = (uint64_t)ntp->seconds - NTP_EPOCH_DELTA;
-  uint32_t ms = (uint32_t)(((uint64_t)ntp->fraction * 1000ULL) >> 32);
-  if (ms > 999) ms = 999;
+
+  /* Frame number — same calculation as ntp_to_smpte_timecode in sei-handler.c */
+  uint64_t product = (uint64_t)ntp->fraction * (uint64_t)fps_num;
+  uint64_t denom = (uint64_t)fps_den * 4294967296ULL;
+  uint32_t frame = (uint32_t)(product / denom);
+  uint32_t fps_ceil = (fps_num + fps_den - 1) / fps_den;
+  if (fps_ceil > 0 && frame >= fps_ceil)
+    frame = fps_ceil - 1;
 
   uint64_t s = unix_sec;
   int sec  = (int)(s % 60); s /= 60;
@@ -101,8 +109,8 @@ static void ntp_to_iso8601(const ntp_timestamp_t *ntp, char *buf, size_t buf_siz
     month++;
   }
 
-  snprintf(buf, buf_size, "%04d-%02d-%02dT%02d:%02d:%02d.%03uZ",
-           year, month + 1, days + 1, hour, min, sec, ms);
+  snprintf(buf, buf_size, "%04d-%02d-%02dT%02d:%02d:%02d:%02uZ",
+           year, month + 1, days + 1, hour, min, sec, frame);
 }
 
 static const uint8_t *get_glyph(char c) {
@@ -173,12 +181,13 @@ static void draw_char(timecode_frame_t *f, char c, int x0, int y0, int scale) {
 }
 
 void timecode_render_draw(const ntp_timestamp_t *ntp,
+                          uint32_t fps_num, uint32_t fps_den,
                           timecode_frame_t *frame,
                           timecode_position_t position) {
-  if (!ntp || !frame || !frame->data[0]) return;
+  if (!ntp || !frame || !frame->data[0] || !fps_num || !fps_den) return;
 
   char text[32];
-  ntp_to_iso8601(ntp, text, sizeof(text));
+  ntp_to_iso8601_frames(ntp, fps_num, fps_den, text, sizeof(text));
   int len = (int)strlen(text);
 
   int scale = get_scale(frame->height);
