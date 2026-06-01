@@ -9,7 +9,7 @@ permissions:
 
 env:
   OBS_VERSION: "32.0.0"
-  OBS_DEPS_VERSION: "2026-05-21"
+  OBS_DEPS_VERSION: "2025-08-23"
   QT_VERSION: "6.8.3"
 
 jobs:
