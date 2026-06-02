@@ -5,6 +5,7 @@
 
 #ifdef ENABLE_VIDEOTOOLBOX
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -339,9 +340,7 @@ void *vt_encoder_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
     if (enc->profile && *enc->profile)
       av_dict_set(&opts, "profile", enc->profile, 0);
 
-    enc->codec_context->rc_max_rate = enc->bitrate * 1000;
-    enc->codec_context->rc_buffer_size = enc->bitrate * 1000;
-    av_dict_set(&opts, "nal-hrd", "cbr", 0);
+    av_dict_set(&opts, "nal-hrd", "vbr", 0);
   }
 
   char errbuf[128];
@@ -420,6 +419,7 @@ bool vt_encoder_encode_internal(void *data, struct encoder_frame *frame,
     ntp_client_sync(&enc->ntp_client);
   }
   ntp_client_get_time(&enc->ntp_client, &enc->current_ntp_time);
+  pts_ntp_map_store(&enc->pts_ntp_map, frame->pts, &enc->current_ntp_time);
 
   av_frame_unref(enc->frame);
 
@@ -493,8 +493,16 @@ bool vt_encoder_encode_internal(void *data, struct encoder_frame *frame,
       .h264_cpb_removal_delay_length = enc->h264_cpb_removal_delay_length,
       .h264_dpb_output_delay_length = enc->h264_dpb_output_delay_length,
   };
-  build_sei_bundle(0 /* H.264 */, keyframe, frame->pts,
-                   &enc->current_ntp_time, (uint32_t)enc->fps_num,
+  ntp_timestamp_t packet_ntp_time;
+  if (!pts_ntp_map_lookup(&enc->pts_ntp_map, enc->packet->pts,
+                          &packet_ntp_time)) {
+    encoder_log(LOG_WARNING, enc,
+                "PTS->NTP lookup miss for PTS=%" PRId64 ", using current NTP",
+                (int64_t)enc->packet->pts);
+    packet_ntp_time = enc->current_ntp_time;
+  }
+  build_sei_bundle(0 /* H.264 */, keyframe, enc->packet->pts,
+                   &packet_ntp_time, (uint32_t)enc->fps_num,
                    (uint32_t)enc->fps_den, &codec_info, &sei_bundle,
                    &sei_bundle_size);
 

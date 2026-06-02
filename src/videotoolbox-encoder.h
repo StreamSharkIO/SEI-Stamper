@@ -6,6 +6,7 @@
 #ifdef ENABLE_VIDEOTOOLBOX
 
 #include "ntp-client.h"
+#include "pts-ntp-map.h"
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
@@ -53,6 +54,7 @@ typedef struct vt_encoder {
   struct ntp_client ntp_client;
   uint64_t last_ntp_sync_time;
   ntp_timestamp_t current_ntp_time;
+  pts_ntp_map_t pts_ntp_map;
   bool ntp_enabled;
   uint32_t ntp_sync_interval_ms;
 
