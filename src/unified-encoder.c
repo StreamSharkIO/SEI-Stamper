@@ -370,14 +370,6 @@ bool unified_encoder_encode(void *data, struct encoder_frame *frame,
     return false;
   }
 
-  static uint64_t unified_frame_count = 0;
-  unified_frame_count++;
-
-  if (unified_frame_count % 30 == 1) {
-    blog(LOG_INFO, "[Unified Encoder] encode() called: frame #%llu",
-         unified_frame_count);
-  }
-
   // 转发到相应的底层编码器
   switch (enc->hardware_type) {
   case HARDWARE_TYPE_INTEL:
